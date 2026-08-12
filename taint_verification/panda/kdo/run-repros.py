@@ -46,16 +46,21 @@ def main() -> None:
 		help='Path to the reports')
 	opts.add_argument('--outfile', type=argparse.FileType('w'), required=True,
 		help='Output file')
+	opts.add_argument('--share-path', type=pathlib.Path, required=True,
+		help='Host directory to share with the guest via virtio-9p (mounted at /mnt/)')
 	args = opts.parse_args()
 
 	reports_path = args.path
-	kdo.update_config()
+	kdo.update_config(share_path=str(args.share_path))
 
 	os.chdir("/root/out")
 
 	reports_json = json.load(args.reports_file)
 
-	repros = kdo.parse_reports_json(reports_path, reports_json)
+	repros = []
+	for report in reports_json:
+		repro_id = report['id']
+		repros.append({"id": repro_id})
 
 	#################
 	# 3) get rootfs #
@@ -64,7 +69,7 @@ def main() -> None:
 	rootfs_path = "rootfs/"
 	busybox_path="busybox/"
 
-	kdo.copy_repros_rootfs(rootfs_path, repros)
+	kdo.setup_rootfs_scripts(rootfs_path)
 
 	image_path = os.path.join(os.getcwd(), image_path)
 	rootfs_path = os.path.join(os.getcwd(), rootfs_path)
@@ -81,22 +86,11 @@ def main() -> None:
 	record_results = []
 
 	for repro in repros:
-		if repro['fault_type'] != "memcpy":
-			continue
-
 		if len(record_results) > 0:
 			print(json.dumps(record_results[len(record_results)-1], indent=2), file=sys.stderr)
 
 		os.chdir("/root/out")
-		#########################
-		# 1) determine repro id #
-		#########################
-		########################################
-		# 2) determine call id from repro data #
-		########################################
-
 		repro_id = repro['id']
-		callid = int(repro['call_id'])
 
 		#############
 		# 4) record #
@@ -108,7 +102,7 @@ def main() -> None:
 		os.chdir(repro_id)
 
 		start = time.time()
-		timeout = kdo.record(kernel, rootfs, 480, repro_id)
+		timeout = kdo.record(kernel, rootfs, 3600*2, repro_id)
 		end = time.time()
 		print(f'time: {end - start}')
 		repro['time'] = end - start
@@ -123,17 +117,15 @@ def main() -> None:
 		##########################
 
 		record_logging = []
-		with open('./panda_logging.txt', 'r') as f:
-			lines = f.readlines()
-			if len(lines) > 0:
-				record_logging = lines[-1].split("', '")
+		with open('./record.txt', 'r', encoding='utf-8', errors='replace') as f:
+			record_logging = f.readlines()
 
 		if len(record_logging) == 0:
 			repro['err'] = 'nodata'
 			record_results.append(repro)
 			continue
 
-		if re.search('REPRODUCER DID NOT CRAS', record_logging[len(record_logging)-1]):
+		if any(re.search('REPRODUCER DID NOT CRAS', line) for line in record_logging):
 			repro['err'] = 'no_crash'
 			record_results.append(repro)
 			continue

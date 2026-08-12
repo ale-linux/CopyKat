@@ -17,6 +17,7 @@ from enum import Enum
 import urllib.request
 import subprocess
 import hashlib
+import select
 import shutil
 import time
 import stat
@@ -46,25 +47,45 @@ expect_prompt="(REPRODUCER DID NOT CRASH|KASAN|KCSAN|UBSAN|BUG|WARNING|INFO|prot
 ready_serial_signal = "READY TO RUN REPRO"
 init_code = f"""#!/bin/sh
 
+echo "[init] starting /init"
+
 # Mount various important file systems
+echo "[init] mount proc"
 mount -t proc none /proc
+echo "[init] mount sysfs"
 mount -t sysfs none /sys
+echo "[init] mount run tmpfs"
 mount -t tmpfs none /run
+echo "[init] mount tmp tmpfs"
 mount -t tmpfs none /tmp
+echo "[init] mount devtmpfs"
 mount -t devtmpfs none /dev
+echo "[init] mount debugfs"
 mount -t debugfs none /sys/kernel/debug
+echo "[init] mount securityfs"
 mount -t securityfs none /sys/kernel/security
+echo "[init] mount configfs"
 mount -t configfs none /sys/kernel/config
+echo "[init] mount binfmt_misc"
 mount -t binfmt_misc none /proc/sys/fs/binfmt_misc
+echo "[init] mount fusectl"
 mount -t fusectl none /sys/fs/fuse/connections
+echo "[init] mount pstore"
 mount -t pstore none /sys/fs/pstore
+echo "[init] mount bpf"
 mount -t bpf none /sys/fs/bpf
+echo "[init] mount tracefs"
 mount -t tracefs none /sys/kernel/tracing
+echo "[init] mkdir /dev/pts /dev/shm"
 mkdir -p /dev/pts /dev/shm
+echo "[init] mount devpts"
 mount -t devpts none /dev/pts
+echo "[init] mount /dev/shm tmpfs"
 mount -t tmpfs none /dev/shm
+echo "[init] finished filesystem setup"
 
 # Use the serial line to notify our wrapper of boot completion
+echo "[init] signaling boot ready"
 echo {ready_serial_signal}
 
 # Wait for an enter key before running the reproducer
@@ -434,23 +455,138 @@ def has_snapshot(rootfs):
     result = subprocess.run(['qemu-img', 'snapshot', '-l', rootfs.path], stdout=subprocess.PIPE)
     return b"root" in result.stdout
 
+def _normalize_serial_log(raw_path, text_path):
+    with open(raw_path, 'r', encoding='utf-8', errors='replace') as src, \
+            open(text_path, 'w', encoding='utf-8') as dst:
+        for line in src:
+            match = re.search(r"Current line = bytearray\(b'(.*)'\)$", line.rstrip())
+            if not match:
+                continue
+
+            chunk = match.group(1)
+            chunk = bytes(chunk, 'utf-8').decode('unicode_escape')
+            if chunk.endswith('\r'):
+                chunk = chunk[:-1]
+            dst.write(chunk + '\n')
+
+# Read from panda.serial_socket as data arrives, writing each chunk to `out_file`
+# immediately (flushing after every write) so output is visible in real time.
+#
+# `sentinel` may be:
+#   - bytes:          stop when that exact byte sequence appears in the stream
+#   - compiled regex: stop when the pattern matches anywhere in the decoded buffer
+#
+# Neither sentinels nor regex patterns straddle a newline, so it is safe to hold
+# back only the current (incomplete) line and flush all completed lines eagerly.
+#
+# Returns (before, matched) where:
+#   before  — bytes written to out_file before the sentinel (b'' if sentinel was first)
+#   matched — the sentinel text as a str (useful when sentinel is a regex with alternatives)
+# Both are None if the socket closes before the sentinel is found.
+def _serial_read_until_streaming(panda, sentinel, out_file):
+    is_regex = hasattr(sentinel, 'match')  # compiled re pattern
+
+    def _find(buf):
+        """Return (start, end, matched_str) of sentinel in buf, or None."""
+        if is_regex:
+            m = sentinel.search(buf.decode('utf-8', errors='replace'))
+            if m:
+                return (m.start(), m.end(), m.group(0))
+        else:
+            idx = buf.find(sentinel)
+            if idx >= 0:
+                return (idx, idx + len(sentinel), sentinel.decode('utf-8', errors='replace'))
+        return None
+
+    # Drain anything already buffered from a previous call
+    buf = panda.serial_unconsumed_data
+    panda.serial_unconsumed_data = b''
+
+    while panda.serial_socket is not None:
+        found = _find(buf)
+        if found is not None:
+            start, end, matched = found
+            # _find works on the decoded string; for our all-ASCII content the
+            # character offsets equal byte offsets, so slicing buf directly is safe.
+            before = buf[:start]
+            panda.serial_unconsumed_data = buf[end:]
+            if before:
+                out_file.write(before)
+                out_file.flush()
+            return before, matched
+
+        # Neither sentinels nor regex patterns straddle a newline, so it is safe
+        # to flush all complete lines and retain only the current incomplete line.
+        last_nl = buf.rfind(b'\n')
+        if last_nl >= 0:
+            out_file.write(buf[:last_nl + 1])
+            out_file.flush()
+            buf = buf[last_nl + 1:]
+
+        try:
+            readable, _, _ = select.select([panda.serial_socket], [], [], 0.5)
+            if not readable:
+                continue
+            data = panda.serial_socket.recv(65535)
+        except Exception as e:
+            if '[Errno 11]' in str(e) or '[Errno 35]' in str(e):
+                continue
+            raise
+        if not data:
+            # Socket closed before sentinel was found
+            print(f"[rrr] _serial_read_until_streaming: socket closed, buf tail={buf!r}")
+            if buf:
+                out_file.write(buf)
+                out_file.flush()
+            return None, None
+        buf += data
+
+    print(f"[rrr] _serial_read_until_streaming: serial_socket became None, buf tail={buf!r}")
+    return None, None
+
 # Panda analysis passes
 # Run in different processes because each Panda object requires a fresh address space
+def _drain_and_snap(panda, log_file):
+    """Drain serial output for 30 s then overwrite the 'root' snapshot.
+
+    Operates on an *already-running* panda object (i.e. must be called from
+    inside a queue_blocking callback).  Does NOT call end_analysis — the
+    caller decides what to do next.
+    """
+    log("Draining serial output for 30s before snapshotting...")
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        try:
+            readable, _, _ = select.select([panda.serial_socket], [], [], 0.5)
+            if readable:
+                data = panda.serial_socket.recv(65535)
+                if data:
+                    log_file.write(data)
+                    log_file.flush()
+        except Exception:
+            pass
+
+    log("Reached snapshot point. Taking snapshot...")
+    charptr = panda.ffi.new("char[]", bytes("root", "utf-8"))
+    panda.queue_main_loop_wait_fn(panda.libpanda.panda_snap, [charptr])
+    panda.queue_main_loop_wait_fn(panda.libpanda.panda_cont)
+    time.sleep(15)
+    log("Saved snapshot")
+
+
 def __snapshot(rootfs, kernel):
     panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
                   extra_args=config["extra_qemu_machine_args"] + " " + config["extra_qemu_kernel_args"].format(kernel))
+    text_log_path = 'boot.txt'
 
     @panda.queue_blocking
     def setup():
-        panda.serial_read_until(config["ready_serial_signal"].encode())
-        log("Reached snapshot point. Giving Panda 5 second to save it...")
-        time.sleep(5)
+        with open(text_log_path, 'wb') as f:
+            _serial_read_until_streaming(panda, config["ready_serial_signal"].encode(), f)  # return value unused here
+            f.write(config["ready_serial_signal"].encode())
+            f.write(b"\n")
 
-        charptr = panda.ffi.new("char[]", bytes("root", "utf-8"))
-        panda.queue_main_loop_wait_fn(panda.libpanda.panda_snap, [charptr])
-        panda.queue_main_loop_wait_fn(panda.libpanda.panda_cont)
-        time.sleep(5)
-        log("Saved snapshot")
+            _drain_and_snap(panda, f)
 
         panda.end_analysis()
 
@@ -463,12 +599,12 @@ def snapshot(rootfs, kernel):
     p.join()
 
     if p.exitcode:
-        raise "Taking snapshot failed"
+        raise Exception("Taking snapshot failed")
 
 def __record(rootfs, output):
     panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
                   extra_args=config["extra_qemu_machine_args"])
-    panda.serial_console.set_logging('panda_logging.txt')
+    record_log_path = output + '-panda-raw.txt'
 
     @panda.queue_blocking
     def drive():
@@ -476,9 +612,12 @@ def __record(rootfs, output):
         log("Starting record...")
         panda.run_monitor_cmd(f"begin_record {output}")
 
+        # Kick off the reproducer (send Enter to the waiting `read` in /init)
         panda.serial_console.send_eol()
-        panda.serial_console.expect(timeout=None)
-        print(panda.serial_console.get_partial())
+
+        # Stream serial output to file in real time, stopping on the crash/clean sentinel
+        with open(record_log_path, 'wb') as f:
+            _serial_read_until_streaming(panda, re.compile(config["expect_prompt"]), f)  # return value unused here
 
         panda.run_monitor_cmd("end_record")
         log("Finished record")

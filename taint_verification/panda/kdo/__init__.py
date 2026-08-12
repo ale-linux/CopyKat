@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
 from pandare import Panda
-from pandare import panda_expect
-
 import rrr
-from rrr import arch, mem, expect_prompt, extra_qemu_machine_args, config
+from rrr import arch, mem, expect_prompt, extra_qemu_machine_args, config, _drain_and_snap
 
 import os
+import select
 import time
 import importlib
 import shutil
@@ -38,26 +37,75 @@ cb_enabled = False
 
 expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|KDO|WARNING|INFO|protection fault|Rebooting in 86400 seconds|~ # )"
 expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|KDO|Rebooting in 86400 seconds|~ # )"
-expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|Rebooting in 86400 seconds|KDO:\s*([^()]*)\s*\(([^)]*)\)|~ # )"
+expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|Rebooting in 86400 seconds|KDO:\s*([^()]*)\s*\(([^)]*)\))"
+
+# Installed into /usr/bin/rsync-repros inside the rootfs.
+# Usage: rsync-repros SRC DST
+# Syncs executable files from SRC into DST, preserving paths relative to SRC.
+# Calls sync(1) before exiting when anything was written.
+# Exits 1 if anything changed, 0 otherwise.
+rsync_repros_script = """#!/bin/sh
+SRC=$1
+DST=$2
+CHANGED=false
+for src_file in $(find "$SRC" -type f -executable); do
+    rel="${src_file#$SRC}"
+    rel="${rel#/}"
+    dst_file="$DST/$rel"
+    if [ ! -e "$dst_file" ]; then
+        install -D "$src_file" "$dst_file"
+        CHANGED=true
+    elif ! cmp -s "$src_file" "$dst_file"; then
+        install -D "$src_file" "$dst_file"
+        CHANGED=true
+    fi
+done
+if [ "$CHANGED" = "true" ]; then
+    sync
+    exit 1
+fi
+exit 0
+"""
 init_code = f"""#!/bin/sh
 
+echo "[init] starting /init"
+
 # Mount various important file systems
+echo "[init] mount proc"
 mount -t proc none /proc
+echo "[init] mount sysfs"
 mount -t sysfs none /sys
+echo "[init] mount run tmpfs"
 mount -t tmpfs none /run
+echo "[init] mount tmp tmpfs"
 mount -t tmpfs none /tmp
+echo "[init] mount devtmpfs"
 mount -t devtmpfs none /dev
+echo "[init] mount debugfs"
 mount -t debugfs none /sys/kernel/debug
+echo "[init] mount securityfs"
 mount -t securityfs none /sys/kernel/security
+echo "[init] mount configfs"
 mount -t configfs none /sys/kernel/config
+echo "[init] mount binfmt_misc"
 mount -t binfmt_misc none /proc/sys/fs/binfmt_misc
+echo "[init] mount fusectl"
 mount -t fusectl none /sys/fs/fuse/connections
+echo "[init] mount pstore"
 mount -t pstore none /sys/fs/pstore
+echo "[init] mount bpf"
 mount -t bpf none /sys/fs/bpf
+echo "[init] mount tracefs"
 mount -t tracefs none /sys/kernel/tracing
+echo "[init] mkdir /dev/pts /dev/shm"
 mkdir -p /dev/pts /dev/shm
+echo "[init] mount devpts"
 mount -t devpts none /dev/pts
+echo "[init] mount /dev/shm tmpfs"
 mount -t tmpfs none /dev/shm
+echo "[init] mkdir /mnt"
+mkdir /mnt
+echo "[init] finished filesystem setup"
 
 # disable runtime completely
 # echo '/' > /proc/kdo_fault_filter
@@ -66,80 +114,167 @@ mount -t tmpfs none /dev/shm
 # echo '^' > /proc/kdo_fault_filter
 
 # disable kasan checks
-echo 'a' > /proc/kdo_fault_filter
+# echo 'a' > /proc/kdo_fault_filter
 # disable kcov functions
-echo 'k' > /proc/kdo_fault_filter
+# echo 'k' > /proc/kdo_fault_filter
 
-# Use the serial line to notify our wrapper of boot completion
-echo {config["ready_serial_signal"]}
-
-## # Wait for an enter key before running the reproducer
-## read
-##
-## # Run the reproducer
-## /repros/repro-$REPLY
-##
-## # If we're here, it didn't crash the kernel. Write something and wait
-## echo REPRODUCER DID NOT CRASH
-## read
-##
-## # If we end up here, someone is debugging manually, drop them into a shell
-setsid /sbin/getty -l /bin/sh -n 115200 ttyS0
+# Command loop: emit the ready signal, then wait for a command from the wrapper.
+# The wrapper may send "__rsync__" to trigger a repro sync (and will re-snapshot
+# if anything changed), then send the actual repro name.  The signal is emitted
+# at the top of each iteration so it is visible both on first boot and after a
+# re-snapshot + revert.
+while true; do
+    echo "[init] signaling boot ready"
+    echo {config["ready_serial_signal"]}
+    if read -t 300 cmd && [ -n "$cmd" ]; then
+        cmd=$(echo "$cmd" | tr -d '\\r')
+        if [ "$cmd" = "__rsync__" ]; then
+            mount -t 9p -o trans=virtio hostshare /mnt/
+            rsync-repros /mnt /repros
+            RSYNC_EXIT=$?
+            umount /mnt
+            echo "RSYNC_EXIT:$RSYNC_EXIT"
+        else
+            echo "[init] running repro: $cmd"
+            /repros/$cmd
+            # If we reach here the repro exited without crashing the kernel
+            echo REPRODUCER DID NOT CRASH
+            # Block so the wrapper can observe the sentinel before the VM exits
+            read
+            break
+        fi
+    else
+        echo "[init] no command received, dropping to shell"
+        setsid /sbin/getty -l /bin/sh -n 115200 ttyS0
+        break
+    fi
+done
 """
 
 conf = config
 conf["expect_prompt"] = expect_prompt
 conf["init_code"] = init_code
 
-def update_config():
+def update_config(share_path):
+	conf["extra_qemu_machine_args"] = (
+		extra_qemu_machine_args
+		+ f" -fsdev local,id=fsdev0,path={share_path},security_model=passthrough"
+		+ " -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare"
+	)
+	print(f"[kdo] config: share_path={share_path!r}")
+	print(f"[kdo] config: extra_qemu_machine_args={conf['extra_qemu_machine_args']!r}")
+	print(f"[kdo] config: expect_prompt={conf['expect_prompt']!r}")
+	print(f"[kdo] config: ready_serial_signal={conf['ready_serial_signal']!r}")
 	rrr.update_config(conf)
 
 repro_crashed = True
-last_prompt = ""
 def __record(rootfs, output, timeout, repro_id):
+	record_log_path = 'record.txt'
 	panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
 			extra_args=config["extra_qemu_machine_args"])
-	panda.serial_console.set_logging('panda_logging.txt')
 
 	@panda.queue_blocking
 	def drive():
 		global repro_crashed
-		global last_prompt
+
+		ready_re    = re.compile(re.escape(config["ready_serial_signal"]))
+		rsync_re    = re.compile(r'RSYNC_EXIT:(\d+)')
+		sentinel_re = re.compile(config["expect_prompt"])
+		repro_name  = f"{repro_id}/repro"
 
 		print("drive starts")
 		panda.revert_sync("root")
+
+		# We write directly to serial_console.fd (bypassing its internal
+		# consumed_first / expect("") buffering) so that _serial_read_until_streaming
+		# retains exclusive ownership of the read side and we get full log visibility.
+		def serial_write(data: bytes):
+			os.write(panda.serial_console.fd, data + b"\n")
+
+		# --- rsync step ---
+		# revert_sync uses QEMU's loadvm which is synchronous — when it returns
+		# the guest is already running and /init is already blocked on
+		# `read -t 300 cmd` (it emitted the ready signal before the snapshot).
+		# Drain any stale FIFO bytes left from before the snapshot, then send
+		# __rsync__ directly.  All output is appended to sync.txt for debugging.
+		ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+		with open('sync.txt', 'ab') as sync_log:
+			sync_log.write(f"\n--- {ts} repro={repro_id} revert ---\n".encode())
+			sync_log.flush()
+
+			# Drain stale FIFO bytes (up to 2s) before sending anything.
+			print("[kdo] draining stale serial bytes after revert...")
+			deadline = time.monotonic() + 2
+			while time.monotonic() < deadline:
+				r, _, _ = select.select([panda.serial_socket], [], [], 0.1)
+				if r:
+					data = panda.serial_socket.recv(65535)
+					if data:
+						sync_log.write(data)
+						sync_log.flush()
+
+			print("[kdo] sending __rsync__ command...")
+			serial_write(b"__rsync__")
+
+			print("[kdo] waiting for RSYNC_EXIT:N...")
+			_before, matched_rsync = rrr._serial_read_until_streaming(panda, rsync_re, sync_log)
+			if matched_rsync is None:
+				raise RuntimeError("[kdo] serial closed before RSYNC_EXIT — programming error")
+			sync_log.write(matched_rsync.encode('utf-8', errors='replace') + b"\n")
+			sync_log.flush()
+
+		rsync_exit = int(matched_rsync.split(':')[1])
+		print(f"[kdo] rsync-repros exit code: {rsync_exit}")
+
+		if rsync_exit != 0:
+			# Something changed (rsync-repros already called sync before exiting).
+			# /init loops back with the share unmounted — safe to snapshot.
+			print("[kdo] changes detected; re-snapshotting...")
+			with open('sync.txt', 'ab') as sync_log:
+				sync_log.write(f"--- {ts} re-snapshotting ---\n".encode())
+				sync_log.flush()
+				_drain_and_snap(panda, sync_log)
+			print("[kdo] re-snapshot saved, reverting...")
+			panda.revert_sync("root")
+			# After re-snapshot revert, drain stale bytes again before recording.
+			with open('sync.txt', 'ab') as sync_log:
+				sync_log.write(f"--- {ts} draining after re-snapshot revert ---\n".encode())
+				sync_log.flush()
+				deadline = time.monotonic() + 2
+				while time.monotonic() < deadline:
+					r, _, _ = select.select([panda.serial_socket], [], [], 0.1)
+					if r:
+						data = panda.serial_socket.recv(65535)
+						if data:
+							sync_log.write(data)
+							sync_log.flush()
+
+		# --- record step ---
 		print("Starting record...")
 		panda.run_monitor_cmd(f"begin_record {output}")
 
-		# panda.serial_console.sendline(str.encode(repro_id))
-		panda.serial_console.expect(timeout=timeout)
-		# print(panda.serial_console.get_partial())
-		panda.run_serial_cmd("/repros/repro-" + repro_id, timeout=timeout)
-		repro_crashed = True
+		print(f"[kdo] sending repro name: {repro_name!r}")
+		serial_write(repro_name.encode())
+		print(f"[kdo] repro name sent, streaming output...")
+		with open(record_log_path, 'wb') as f:
+			_before, matched = rrr._serial_read_until_streaming(panda, sentinel_re, f)
+			print(f"[kdo] sentinel: matched={matched!r}, before len={len(_before) if _before else 0}")
+			if matched:
+				f.write(matched.encode('utf-8', errors='replace'))
+				f.flush()
 
-		if re.search('~ # ', panda.serial_console.last_prompt):
-			repro_crashed = False
-
-		last_prompt = panda.serial_console.last_prompt
+		repro_crashed = matched != 'REPRODUCER DID NOT CRASH'
+		print(f'[kdo] __record: sentinel matched={matched!r}, repro_crashed={repro_crashed}')
 
 		panda.run_monitor_cmd("end_record")
 		print("Finished record")
 		panda.end_analysis()
 		print("drive returns")
 
-	try:
-		panda.run()
-	except panda_expect.TimeoutExpired:
-		with open('panda_logging.txt', 'a') as f:
-			f.write("KDO_PANDA_HAS_TIMED_OUT")
+	panda.run()
 
-	global last_prompt
 	global repro_crashed
-	print(f'__record exits: last prompt {last_prompt}, repro crashed {repro_crashed}')
-
-	if not repro_crashed:
-		with open('panda_logging.txt', 'a') as f:
-			f.write("\nREPRODUCER DID NOT CRAS")
+	print(f'__record exits: repro_crashed={repro_crashed}')
 
 def record(kernel, rootfs, timeout, repro_id, output="record"):
 	return rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id])
@@ -705,19 +840,15 @@ def parse_reports_json(reports_path, reports_json):
 
 	return repros
 
-def copy_repros_rootfs(rootfs_path, repros):
-	rootfs_repros_path = "rootfs/repros"
+def setup_rootfs_scripts(rootfs_path):
+	"""Install helper scripts into the rootfs tree (no repros baked in — those
+	are synced at runtime from the host share via rsync-repros)."""
 	if not os.path.isdir(rootfs_path):
 		os.mkdir(rootfs_path)
-	if not os.path.isdir(rootfs_repros_path):
-		os.mkdir(rootfs_repros_path)
 
-	# copy in all repros
-	for repro in repros:
-		repro_path = repro['path']
-		repro_id = repro['id']
-
-		rootfs_repro_path = os.path.join(rootfs_path, f"repros/repro-{repro_id}")
-		shutil.copyfile(repro_path, rootfs_repro_path)
-		mode = os.stat(rootfs_repro_path).st_mode
-		os.chmod(rootfs_repro_path, mode | stat.S_IEXEC)
+	# install rsync-repros helper into /usr/bin (on PATH) inside the rootfs
+	rsync_script_path = os.path.join(rootfs_path, "usr/bin/rsync-repros")
+	os.makedirs(os.path.dirname(rsync_script_path), exist_ok=True)
+	with open(rsync_script_path, 'w') as f:
+		f.write(rsync_repros_script)
+	os.chmod(rsync_script_path, os.stat(rsync_script_path).st_mode | stat.S_IEXEC)
