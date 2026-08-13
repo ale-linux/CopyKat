@@ -29,8 +29,8 @@ def main() -> None:
 	for d in data:
 		if d['id'] in recd:
 			rr = recd[d['id']]
-			del rr["call_id"]
-			del rr["fault_type"]
+			rr.pop("call_id", None)
+			rr.pop("fault_type", None)
 			del rr["id"]
 			d.update({"record" : rr})
 

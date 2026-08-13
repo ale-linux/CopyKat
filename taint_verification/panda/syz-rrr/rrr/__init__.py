@@ -651,15 +651,12 @@ def record(kernel, rootfs, timeout, record_func=__record, output="record", addit
     p.join(timeout=timeout)
     print(f'recording completed, rv {p.exitcode}')
 
-    if p.exitcode == None:
+    if p.exitcode is None:
         # the process is still running and we timed out
         p.terminate()
-        return True
+        return None
 
-    if p.exitcode:
-        raise Exception("Recording execution failed")
-
-    return False
+    return p.exitcode
 
 def __replay(rootfs, record):
     crashlogf = open(tempfile.NamedTemporaryFile(prefix="crash_info_", suffix=".log", dir=None, delete=False).name, "w")

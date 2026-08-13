@@ -3,38 +3,13 @@
 import argparse
 import json
 import os
-import re
-import shutil
 import sys
 
-import rrr
-from rrr import Stimulus, Rootfs, Kernel, config
+from rrr import Rootfs, Kernel, config
+from kdo import RecordStatus
 import kdo
 import time
 import pathlib
-
-def run_repro(repro_id, sink_call_id, rootfs, kernel):
-	kdo.record(kernel, rootfs, repro_id)
-
-	record_logging = []
-	with open('/root/out/panda_logging.txt', 'r') as f:
-		lines = f.readlines()
-		if len(lines) > 0:
-			record_logging = lines[-1].split("', '")
-
-	r = re.compile('^.*Write of size (?P<size>.*) at addr (?P<addr>.*) by task.*$')
-	addrs = [m.groupdict() for m in (r.match(line) for line in record_logging) if m]
-
-	if len(addrs) == 0:
-		print("COULD NOT FIND DST ADDR")
-		return
-
-	target_addr = int(addrs[0]['addr'], 16)
-	kdo.replay(rootfs, kernel, sink_call_id=sink_call_id, target_addr=target_addr)
-
-	shutil.copy2('/root/out/panda_logging.txt', f'/root/out/panda_logging-{repro_id}.txt')
-	shutil.copy2('/root/out/kllvm_output', f'/root/out/kllvm_output-{repro_id}')
-	shutil.copy2('/root/out/record-rr-nondet.log', f'/root/out/record-rr-nondet-{repro_id}.log')
 
 
 def main() -> None:
@@ -48,32 +23,23 @@ def main() -> None:
 		help='Output file')
 	opts.add_argument('--share-path', type=pathlib.Path, required=True,
 		help='Host directory to share with the guest via virtio-9p (mounted at /mnt/)')
+	opts.add_argument('--skip-rsync', action='store_true', default=False,
+		help='Skip the rsync step before recording (repros must already be present in the snapshot)')
 	args = opts.parse_args()
 
-	reports_path = args.path
 	kdo.update_config(share_path=str(args.share_path))
 
 	os.chdir("/root/out")
 
 	reports_json = json.load(args.reports_file)
 
-	repros = []
-	for report in reports_json:
-		repro_id = report['id']
-		repros.append({"id": repro_id})
+	repros = [{"id": report['id']} for report in reports_json]
 
-	#################
-	# 3) get rootfs #
-	#################
-	image_path = f'rootfs.qcow2'
-	rootfs_path = "rootfs/"
-	busybox_path="busybox/"
+	image_path = os.path.join(os.getcwd(), 'rootfs.qcow2')
+	rootfs_path = os.path.join(os.getcwd(), 'rootfs/')
+	busybox_path = os.path.join(os.getcwd(), 'busybox/')
 
 	kdo.setup_rootfs_scripts(rootfs_path)
-
-	image_path = os.path.join(os.getcwd(), image_path)
-	rootfs_path = os.path.join(os.getcwd(), rootfs_path)
-	busybox_path = os.path.join(os.getcwd(), busybox_path)
 
 	rootfs = Rootfs(
 			None,
@@ -87,14 +53,10 @@ def main() -> None:
 
 	for repro in repros:
 		if len(record_results) > 0:
-			print(json.dumps(record_results[len(record_results)-1], indent=2), file=sys.stderr)
+			print(json.dumps(record_results[-1], indent=2), file=sys.stderr)
 
 		os.chdir("/root/out")
 		repro_id = repro['id']
-
-		#############
-		# 4) record #
-		#############
 
 		if not os.path.exists(repro_id):
 			os.makedirs(repro_id)
@@ -102,54 +64,13 @@ def main() -> None:
 		os.chdir(repro_id)
 
 		start = time.time()
-		timeout = kdo.record(kernel, rootfs, 3600*2, repro_id)
+		status = kdo.record(kernel, rootfs, 3600*2, repro_id, skip_rsync=args.skip_rsync)
 		end = time.time()
 		print(f'time: {end - start}')
 		repro['time'] = end - start
 
-		if timeout:
-			repro['err'] = 'timeout'
-			record_results.append(repro)
-			continue
-
-		##########################
-		# 5) determine addresses #
-		##########################
-
-		record_logging = []
-		with open('./record.txt', 'r', encoding='utf-8', errors='replace') as f:
-			record_logging = f.readlines()
-
-		if len(record_logging) == 0:
-			repro['err'] = 'nodata'
-			record_results.append(repro)
-			continue
-
-		if any(re.search('REPRODUCER DID NOT CRAS', line) for line in record_logging):
-			repro['err'] = 'no_crash'
-			record_results.append(repro)
-			continue
-
-		r = re.compile('^.*Write of size (?P<size>.*) at addr (?P<addr>.*) by task.*$')
-		addrs = [m.groupdict() for m in (r.match(line) for line in record_logging) if m]
-
-		if len(addrs) == 0:
-			repro['err'] = 'no_dst'
-			record_results.append(repro)
-			continue
-
-		target_addr = int(addrs[0]['addr'], 16)
-
-		if len(addrs) == 1:
-			repro['err'] = 'no_src'
-			record_results.append(repro)
-			continue
-
-		cfu_dst_addr = int(addrs[1]['addr'], 16)
-
-		repro['src_addr'] = cfu_dst_addr
-		repro['dst_addr'] = target_addr
-
+		if status != RecordStatus.CRASH:
+			repro['err'] = status.value
 		record_results.append(repro)
 
 	json.dump(record_results, args.outfile, indent=5, sort_keys=True)

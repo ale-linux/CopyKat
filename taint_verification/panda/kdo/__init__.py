@@ -4,6 +4,7 @@ from pandare import Panda
 import rrr
 from rrr import arch, mem, expect_prompt, extra_qemu_machine_args, config, _drain_and_snap
 
+import enum
 import os
 import select
 import time
@@ -17,6 +18,11 @@ import faulthandler
 import tempfile
 
 pattern = re.compile(r"repro-[a-z_]+$")
+
+class RecordStatus(enum.IntEnum):
+	CRASH    = 0
+	NO_CRASH = 1
+	TIMEOUT  = 2
 
 kdo_label_nr = 1
 kdo_taint_addr = None
@@ -167,16 +173,16 @@ def update_config(share_path):
 	print(f"[kdo] config: ready_serial_signal={conf['ready_serial_signal']!r}")
 	rrr.update_config(conf)
 
-repro_crashed = True
-def __record(rootfs, output, timeout, repro_id):
+def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 	record_log_path = 'record.txt'
 	panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
 			extra_args=config["extra_qemu_machine_args"])
 
+	status = RecordStatus.NO_CRASH
+
 	@panda.queue_blocking
 	def drive():
-		global repro_crashed
-
+		nonlocal status
 		ready_re    = re.compile(re.escape(config["ready_serial_signal"]))
 		rsync_re    = re.compile(r'RSYNC_EXIT:(\d+)')
 		sentinel_re = re.compile(config["expect_prompt"])
@@ -191,55 +197,20 @@ def __record(rootfs, output, timeout, repro_id):
 		def serial_write(data: bytes):
 			os.write(panda.serial_console.fd, data + b"\n")
 
-		# --- rsync step ---
-		# revert_sync uses QEMU's loadvm which is synchronous — when it returns
-		# the guest is already running and /init is already blocked on
-		# `read -t 300 cmd` (it emitted the ready signal before the snapshot).
-		# Drain any stale FIFO bytes left from before the snapshot, then send
-		# __rsync__ directly.  All output is appended to sync.txt for debugging.
-		ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-		with open('sync.txt', 'ab') as sync_log:
-			sync_log.write(f"\n--- {ts} repro={repro_id} revert ---\n".encode())
-			sync_log.flush()
-
-			# Drain stale FIFO bytes (up to 2s) before sending anything.
-			print("[kdo] draining stale serial bytes after revert...")
-			deadline = time.monotonic() + 2
-			while time.monotonic() < deadline:
-				r, _, _ = select.select([panda.serial_socket], [], [], 0.1)
-				if r:
-					data = panda.serial_socket.recv(65535)
-					if data:
-						sync_log.write(data)
-						sync_log.flush()
-
-			print("[kdo] sending __rsync__ command...")
-			serial_write(b"__rsync__")
-
-			print("[kdo] waiting for RSYNC_EXIT:N...")
-			_before, matched_rsync = rrr._serial_read_until_streaming(panda, rsync_re, sync_log)
-			if matched_rsync is None:
-				raise RuntimeError("[kdo] serial closed before RSYNC_EXIT — programming error")
-			sync_log.write(matched_rsync.encode('utf-8', errors='replace') + b"\n")
-			sync_log.flush()
-
-		rsync_exit = int(matched_rsync.split(':')[1])
-		print(f"[kdo] rsync-repros exit code: {rsync_exit}")
-
-		if rsync_exit != 0:
-			# Something changed (rsync-repros already called sync before exiting).
-			# /init loops back with the share unmounted — safe to snapshot.
-			print("[kdo] changes detected; re-snapshotting...")
+		if not skip_rsync:
+			# --- rsync step ---
+			# revert_sync uses QEMU's loadvm which is synchronous — when it returns
+			# the guest is already running and /init is already blocked on
+			# `read -t 300 cmd` (it emitted the ready signal before the snapshot).
+			# Drain any stale FIFO bytes left from before the snapshot, then send
+			# __rsync__ directly.  All output is appended to sync.txt for debugging.
+			ts = time.strftime("%Y-%m-%dT%H:%M:%S")
 			with open('sync.txt', 'ab') as sync_log:
-				sync_log.write(f"--- {ts} re-snapshotting ---\n".encode())
+				sync_log.write(f"\n--- {ts} repro={repro_id} revert ---\n".encode())
 				sync_log.flush()
-				_drain_and_snap(panda, sync_log)
-			print("[kdo] re-snapshot saved, reverting...")
-			panda.revert_sync("root")
-			# After re-snapshot revert, drain stale bytes again before recording.
-			with open('sync.txt', 'ab') as sync_log:
-				sync_log.write(f"--- {ts} draining after re-snapshot revert ---\n".encode())
-				sync_log.flush()
+
+				# Drain stale FIFO bytes (up to 2s) before sending anything.
+				print("[kdo] draining stale serial bytes after revert...")
 				deadline = time.monotonic() + 2
 				while time.monotonic() < deadline:
 					r, _, _ = select.select([panda.serial_socket], [], [], 0.1)
@@ -248,6 +219,42 @@ def __record(rootfs, output, timeout, repro_id):
 						if data:
 							sync_log.write(data)
 							sync_log.flush()
+
+				print("[kdo] sending __rsync__ command...")
+				serial_write(b"__rsync__")
+
+				print("[kdo] waiting for RSYNC_EXIT:N...")
+				_before, matched_rsync = rrr._serial_read_until_streaming(panda, rsync_re, sync_log)
+				if matched_rsync is None:
+					raise RuntimeError("[kdo] serial closed before RSYNC_EXIT — programming error")
+				sync_log.write(matched_rsync.encode('utf-8', errors='replace') + b"\n")
+				sync_log.flush()
+
+			rsync_exit = int(matched_rsync.split(':')[1])
+			print(f"[kdo] rsync-repros exit code: {rsync_exit}")
+
+			if rsync_exit != 0:
+				# Something changed (rsync-repros already called sync before exiting).
+				# /init loops back with the share unmounted — safe to snapshot.
+				print("[kdo] changes detected; re-snapshotting...")
+				with open('sync.txt', 'ab') as sync_log:
+					sync_log.write(f"--- {ts} re-snapshotting ---\n".encode())
+					sync_log.flush()
+					_drain_and_snap(panda, sync_log)
+				print("[kdo] re-snapshot saved, reverting...")
+				panda.revert_sync("root")
+				# After re-snapshot revert, drain stale bytes again before recording.
+				with open('sync.txt', 'ab') as sync_log:
+					sync_log.write(f"--- {ts} draining after re-snapshot revert ---\n".encode())
+					sync_log.flush()
+					deadline = time.monotonic() + 2
+					while time.monotonic() < deadline:
+						r, _, _ = select.select([panda.serial_socket], [], [], 0.1)
+						if r:
+							data = panda.serial_socket.recv(65535)
+							if data:
+								sync_log.write(data)
+								sync_log.flush()
 
 		# --- record step ---
 		print("Starting record...")
@@ -263,8 +270,8 @@ def __record(rootfs, output, timeout, repro_id):
 				f.write(matched.encode('utf-8', errors='replace'))
 				f.flush()
 
-		repro_crashed = matched != 'REPRODUCER DID NOT CRASH'
-		print(f'[kdo] __record: sentinel matched={matched!r}, repro_crashed={repro_crashed}')
+		status = RecordStatus.CRASH if matched != 'REPRODUCER DID NOT CRASH' else RecordStatus.NO_CRASH
+		print(f'[kdo] __record: sentinel matched={matched!r}, status={status}')
 
 		panda.run_monitor_cmd("end_record")
 		print("Finished record")
@@ -272,12 +279,16 @@ def __record(rootfs, output, timeout, repro_id):
 		print("drive returns")
 
 	panda.run()
+	print(f'__record exits: status={status}')
+	raise SystemExit(status)
 
-	global repro_crashed
-	print(f'__record exits: repro_crashed={repro_crashed}')
-
-def record(kernel, rootfs, timeout, repro_id, output="record"):
-	return rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id])
+def record(kernel, rootfs, timeout, repro_id, output="record", skip_rsync=False):
+	exitcode = rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id, skip_rsync])
+	if exitcode is None:
+		return RecordStatus.TIMEOUT
+	if exitcode not in RecordStatus._value2member_map_:
+		raise Exception(f"Recording execution failed (exitcode={exitcode})")
+	return RecordStatus(exitcode)
 
 # kdo.replay(rootfs, kernel, sink_call_id=callid, target_addr=[target_addr], ref_memcpy_ctr=ctr)
 #	rrr.replay(rootfs, kernel, record, __replay,
