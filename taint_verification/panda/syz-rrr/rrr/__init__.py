@@ -254,19 +254,31 @@ class Kernel:
         self.debug_path = os.path.join(self.path, "vmlinux")
 
         # DWARF is a pain to parse, but BTF is a joy, let's extract it in JSON
-        log("Extracting BTF debug info ...")
         btf_path = os.path.join(self.path, "vmlinux.btf")
-        pahole = subprocess.run(["pahole", "--btf_encode_detached", btf_path, self.debug_path],
-                                capture_output=True, text=True)
-        if pahole.returncode:
-            raise Exception("Extracting BTF failed: " + pahole.stderr)
+        btf_json_path = os.path.join(self.path, "vmlinux.btf.json")
 
-        log("Extracting BTF debug info as JSON ...")
-        pahole = subprocess.run(["bpftool", "btf", "dump", "-j", "file", btf_path],
-                                capture_output=True, text=True)
-        if pahole.returncode:
-            raise Exception("Extracting BTF JSON failed: " + pahole.stderr)
-        self.types = json.loads(pahole.stdout)["types"]
+        if not os.path.exists(btf_path):
+            log("Extracting BTF debug info ...")
+            pahole = subprocess.run(["pahole", "--btf_encode_detached", btf_path, self.debug_path],
+                                    capture_output=True, text=True)
+            if pahole.returncode:
+                raise Exception("Extracting BTF failed: " + pahole.stderr)
+        else:
+            log(f"Skipping BTF extraction and re-using {btf_path}")
+
+        if not os.path.exists(btf_json_path):
+            log("Extracting BTF debug info as JSON ...")
+            pahole = subprocess.run(["bpftool", "btf", "dump", "-j", "file", btf_path],
+                                    capture_output=True, text=True)
+            if pahole.returncode:
+                raise Exception("Extracting BTF JSON failed: " + pahole.stderr)
+            with open(btf_json_path, "w") as f:
+                f.write(pahole.stdout)
+            self.types = json.loads(pahole.stdout)["types"]
+        else:
+            log(f"Skipping BTF JSON extraction and re-using {btf_json_path}")
+            with open(btf_json_path) as f:
+                self.types = json.load(f)["types"]
 
         ### # PANDA's OSI requires certain offsets to be extracted in a file, do it with gdb
         self.info_path = os.path.join(os.getcwd(), "kernelinfo.conf")
