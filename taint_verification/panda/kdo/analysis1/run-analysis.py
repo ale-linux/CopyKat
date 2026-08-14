@@ -35,16 +35,14 @@ class NestablePool(multiprocessing.pool.Pool):
 		kwargs['context'] = NoDaemonContext()
 		super(NestablePool, self).__init__(*args, **kwargs)
 
+share_path = None
+
 def doit(repro):
 	os.chdir("/root/out")
 
-	image_path = f'rootfs.qcow2'
-	rootfs_path = "rootfs/"
-	busybox_path="busybox/"
-
-	image_path = os.path.join(os.getcwd(), image_path)
-	rootfs_path = os.path.join(os.getcwd(), rootfs_path)
-	busybox_path = os.path.join(os.getcwd(), busybox_path)
+	image_path = os.path.join(os.getcwd(), 'rootfs.qcow2')
+	rootfs_path = os.path.join(os.getcwd(), 'rootfs/')
+	busybox_path = os.path.join(os.getcwd(), 'busybox/')
 
 	rootfs = Rootfs(
 			None,
@@ -53,21 +51,28 @@ def doit(repro):
 			busybox_path=busybox_path,
 			avoid_create=(os.path.isfile(image_path)))
 	kernel = Kernel('/root/kernel')
-	# if args.repro_id and args.repro_id != repro['id']: continue
 
 	print("starting on ", repro['id'])
 
 	repro_id = repro['id']
-	callid = int(repro['call_id'])
-	target_addr = repro['dst_addr']
-	cfu_dst_addr = repro['src_addr']
 
 	if not os.path.exists(repro_id):
 		os.makedirs(repro_id)
 
 	os.chdir(repro_id)
 
-	analysis1.replay(rootfs, kernel, sink_call_id=callid, target_addr=[target_addr], cfu_dst=cfu_dst_addr)
+	# Point rootfs at the per-repro binary so rrr.replay() parses its symbols.
+	# The binary lives in the share path under <repro_id>/repro (same layout
+	# that rsync-repros uses to sync it into the VM).
+	if share_path:
+		repro_bin = os.path.join(share_path, repro_id, "repro")
+		if os.path.isfile(repro_bin):
+			rootfs.stimulus_debug_path = repro_bin
+			print(f"[run-analysis] using repro binary: {repro_bin}")
+		else:
+			print(f"[run-analysis] warning: repro binary not found at {repro_bin}")
+
+	analysis1.replay(rootfs, kernel)
 
 	return True
 
@@ -79,7 +84,12 @@ def main() -> None:
 	opts.add_argument('--repro-id', nargs='*', required=False, help='repro id to reproduce')
 	opts.add_argument('--npar', type=int, default=mp.cpu_count(), required=False, help='parallelism')
 	opts.add_argument('--rerun', action='store_true', help='rerun the analysis only for the undone')
+	opts.add_argument('--share-path', type=str, required=False,
+			help='host share directory containing <repro_id>/repro binaries (for symbol parsing)')
 	args = opts.parse_args()
+
+	global share_path
+	share_path = args.share_path
 
 	analysis1.update_config()
 

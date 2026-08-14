@@ -22,6 +22,7 @@ import shutil
 import time
 import stat
 import json
+import pickle
 import uuid
 import io
 import os
@@ -322,7 +323,11 @@ class Kernel:
             print(f"task.switch_task_hook_addr = {switch_task_hook_addr}",file=info_file)
 
             init_task_addr = gdb_printf("%llu", f"&init_task")
+            # pcpu_hot.current_task was introduced in 6.x; fall back to the
+            # older per-cpu variable for kernels that don't have it.
             current_task_addr = gdb_printf("%llu", f"&pcpu_hot.current_task")
+            if not current_task_addr:
+                current_task_addr = gdb_printf("%llu", f"&current_task")
             print(f"task.current_task_addr = {current_task_addr}",file=info_file)
             print(f"task.init_addr = {init_task_addr}",file=info_file)
 
@@ -344,6 +349,23 @@ class Kernel:
             print("mm.mmap_offset = -1",file=info_file)
             print("vma.vm_next_offset = -1",file=info_file)
 
+            # Fields marked -1 are absent in newer kernels; osi_linux treats -1
+            # as "not present" and skips them gracefully.
+            optional_fields = {
+                "task_struct": {"thread_group", "d_iname"},
+                "dentry": {"d_iname"},
+            }
+            # Some fields were renamed in newer kernels; try these alternatives
+            # before falling back to -1.
+            renamed_fields = {
+                # task_struct->thread_group was removed in 6.x; thread_node is
+                # the list_head that osi_linux uses for the same purpose.
+                ("task_struct", "thread_group"): "thread_node",
+                # dentry->d_iname was replaced by d_shortname (same inline
+                # short-name buffer at the same logical purpose).
+                ("dentry", "d_iname"): "d_shortname.string",
+            }
+
             structs = {"task_struct": ("task", ["tasks", "pid", "tgid", "group_leader",
                                                 "thread_group", "real_parent", "parent", "mm",
                                                 "stack", "real_cred", "cred", "comm", "files",
@@ -364,6 +386,11 @@ class Kernel:
                 print(f"{short_name}.size = {size}",file=info_file)
                 for field in fields:
                     offset = gdb_printf("%d", f"(int)&((struct {name}*)0)->{field}")
+                    if not offset and (name, field) in renamed_fields:
+                        alt = renamed_fields[(name, field)]
+                        offset = gdb_printf("%d", f"(int)&((struct {name}*)0)->{alt}")
+                    if not offset and field in optional_fields.get(name, set()):
+                        offset = "-1"
                     print(f"{short_name}.{field}_offset = {offset}",file=info_file)
 
             gdbmi.exit()
@@ -674,31 +701,53 @@ def replay(rootfs, kernel, record, replay_func=__replay, additional_args=None):
     ignored_symbols_re = re.compile(r'kasan_check_range|__kasan_check_|__asan_|__sanitizer_cov_trace_|.*lockdep_')
     ignored_addresses = set()
 
-    # Parse all known ELF symbol tables
+    # Parse all known ELF symbol tables.
+    # nm output is cached next to each ELF as <elf>.nm.pickle to avoid
+    # re-running nm on large files (e.g. vmlinux) on every replay.
+    # The caller is responsible for deleting the cache file when needed.
     elf_files = [kernel.debug_path, rootfs.busybox_debug_path, rootfs.stimulus_debug_path]
     func_map = {}
     symbol_map = {}
     for elf_file in elf_files:
         if not elf_file:
             continue
-        with open(elf_file, 'rb') as f:
-            log("Parsing " + elf_file + " debug info...")
+        # Never cache the stimulus/repro binary — it changes on every run.
+        cache_path = elf_file + '.nm.pickle' if elf_file != rootfs.stimulus_debug_path else None
+        if cache_path and os.path.exists(cache_path):
+            log("Loading cached symbol table for " + elf_file + " ...")
+            with open(cache_path, 'rb') as cf:
+                cache_data = pickle.load(cf)
+            for name, address in cache_data.items():
+                if re.match(ignored_symbols_re, name):
+                    ignored_addresses.add(address)
+                f = Func(name, address)
+                func_map[address] = f
+                symbol_map[name] = f
+            continue
 
-            result = subprocess.run(['nm', elf_file], stdout=subprocess.PIPE)
-            if b"no symbols" in result.stdout:
-                continue
-            for line in result.stdout.split(b"\n"):
-                elements = line.split()
-                if len(elements) == 3:
-                    address = int(elements[0], 16)
-                    name = elements[2].decode('unicode_escape')
+        log("Parsing " + elf_file + " debug info...")
+        result = subprocess.run(['nm', elf_file], stdout=subprocess.PIPE)
+        if b"no symbols" in result.stdout:
+            continue
+        cache_data = {}
+        for line in result.stdout.split(b"\n"):
+            elements = line.split()
+            if len(elements) == 3:
+                address = int(elements[0], 16)
+                name = elements[2].decode('unicode_escape')
 
-                    if re.match(ignored_symbols_re, name):
-                        ignored_addresses.add(address)
+                if re.match(ignored_symbols_re, name):
+                    ignored_addresses.add(address)
 
-                    f = Func(name, address)
-                    func_map[address] = f
-                    symbol_map[name] = f
+                f = Func(name, address)
+                func_map[address] = f
+                symbol_map[name] = f
+                cache_data[name] = address
+
+        if cache_path:
+            with open(cache_path, 'wb') as cf:
+                pickle.dump(cache_data, cf)
+            log("Saved symbol cache to " + cache_path)
 
     args = [rootfs, kernel, record, ignored_addresses, func_map, symbol_map]
     if additional_args:
