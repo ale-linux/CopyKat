@@ -20,6 +20,7 @@ import tempfile
 pattern = re.compile(r"\brepro$")
 
 analysis = dict()
+cur_syscall = dict()
 memcpy_hit_ctr = 0
 kasan_check_write_hit_ctr = 0
 kdo_label_nr = 1
@@ -213,7 +214,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			log(f'taint: deleted stale taint on {deleted}/{length} bytes at 0x{virt:x}')
 			print(f'[analysis1]   deleted stale taint on {deleted}/{length} bytes at 0x{virt:x}')
 
-	def _do_taint_range(cpu, dst_virt, length, origin, from_base, backtrace):
+	def _do_taint_range(cpu, dst_virt, length, origin, from_base, backtrace, user_context=None):
 		"""
 		Label `length` bytes at kernel virtual address `dst_virt`.
 		Called from on_ret after the copy has completed, so labels stick.
@@ -234,10 +235,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			src = from_base + offset if from_base is not None else None
 			panda.taint_label_ram(paddr, kdo_label_nr)
 			label_map[kdo_label_nr] = {
-				'dst_virt':  hex(dst),
-				'src_virt':  hex(src) if src is not None else None,
-				'origin':    origin,
-				'backtrace': backtrace,
+				'dst_virt':     hex(dst),
+				'src_virt':     hex(src) if src is not None else None,
+				'origin':       origin,
+				'backtrace':    backtrace,
+				'user_context': user_context,
 			}
 			log(f'taint: label {kdo_label_nr} -> dst 0x{dst:x} (phys 0x{paddr:x})'
 			    + (f' src 0x{src:x}' if src is not None else '')
@@ -250,7 +252,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		else:
 			print(f'[analysis1]   WARNING: 0 bytes tainted for dst=0x{dst_virt:x} n={length} [{origin}]')
 
-	def _do_taint_user_src(cpu, user_virt, length, origin, backtrace):
+	def _do_taint_user_src(cpu, user_virt, length, origin, backtrace, user_context=None):
 		"""
 		Label `length` bytes at userspace virtual address `user_virt`.
 		Used for __get_user_N: we place the label on the source *before* the
@@ -270,10 +272,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				continue
 			panda.taint_label_ram(paddr, kdo_label_nr)
 			label_map[kdo_label_nr] = {
-				'dst_virt':  None,   # unknown — propagated by taint2 into caller's store
-				'src_virt':  hex(virt),
-				'origin':    origin,
-				'backtrace': backtrace,
+				'dst_virt':     None,   # unknown — propagated by taint2 into caller's store
+				'src_virt':     hex(virt),
+				'origin':       origin,
+				'backtrace':    backtrace,
+				'user_context': user_context,
 			}
 			log(f'taint: label {kdo_label_nr} -> user src 0x{virt:x} (phys 0x{paddr:x}) [{origin}]')
 			kdo_label_nr += 1
@@ -290,6 +293,25 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	if get_user_2_addr is not None: get_user_map[get_user_2_addr] = ('__get_user_2', 2)
 	if get_user_4_addr is not None: get_user_map[get_user_4_addr] = ('__get_user_4', 4)
 	if get_user_8_addr is not None: get_user_map[get_user_8_addr] = ('__get_user_8', 8)
+
+	# ----------------------------------------------------------------
+	# all_sysenter: snapshot userspace backtrace + syscall args on every
+	#               syscall issued by the reproducer process.
+	# ----------------------------------------------------------------
+	def all_sysenter(cpu, pc, callno):
+		global cur_syscall
+		pname = panda.get_process_name(cpu)
+		if not pattern.search(pname):
+			return
+		cur_syscall.clear()
+		cur_syscall['n']        = callno
+		cur_syscall['backtrace'] = [hex(a) for a in panda.callstack_callers(20, cpu)]
+		cur_syscall['rdi'] = panda.arch.get_reg(cpu, "RDI")
+		cur_syscall['rsi'] = panda.arch.get_reg(cpu, "RSI")
+		cur_syscall['rdx'] = panda.arch.get_reg(cpu, "RDX")
+		cur_syscall['r10'] = panda.arch.get_reg(cpu, "R10")
+		cur_syscall['r8']  = panda.arch.get_reg(cpu, "R8")
+		cur_syscall['r9']  = panda.arch.get_reg(cpu, "R9")
 
 	# ----------------------------------------------------------------
 	# on_call: save args for copy functions; taint src for __get_user_N;
@@ -317,12 +339,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			enable_taint()
 			rsp = panda.arch.get_reg(cpu, "RSP")
 			pending_copies[rsp] = {
-				'func_addr': addr,
-				'to':        to,
-				'from_base': from_,
-				'n':         n,
-				'origin':    '_copy_from_user',
-				'backtrace': [hex(a) for a in panda.callstack_callers(20, cpu)],
+				'func_addr':   addr,
+				'to':          to,
+				'from_base':   from_,
+				'n':           n,
+				'origin':      '_copy_from_user',
+				'backtrace':   [hex(a) for a in panda.callstack_callers(20, cpu)],
+				'user_context': cur_syscall.copy(),
 			}
 			taint_source_ctr['_copy_from_user'] += 1
 			print(f'[analysis1] _copy_from_user #{taint_source_ctr["_copy_from_user"]}(to=0x{to:x}, from=0x{from_:x}, n={n}) — pending on_ret rsp=0x{rsp:x}')
@@ -370,12 +393,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 
 			rsp = panda.arch.get_reg(cpu, "RSP")
 			pending_copies[rsp] = {
-				'func_addr': addr,
-				'to':        dst,
-				'from_base': from_base,
-				'n':         nbytes,
-				'origin':    '_copy_from_iter',
-				'backtrace': [hex(a) for a in panda.callstack_callers(20, cpu)],
+				'func_addr':   addr,
+				'to':          dst,
+				'from_base':   from_base,
+				'n':           nbytes,
+				'origin':      '_copy_from_iter',
+				'backtrace':   [hex(a) for a in panda.callstack_callers(20, cpu)],
+				'user_context': cur_syscall.copy(),
 			}
 			taint_source_ctr['_copy_from_iter'] += 1
 			print(f'[analysis1] _copy_from_iter #{taint_source_ctr["_copy_from_iter"]}(dst=0x{dst:x}, bytes={nbytes}, '
@@ -397,7 +421,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			print(f'[analysis1] {origin} #{taint_source_ctr[origin]}(user=0x{user_addr:x})')
 			enable_taint()
 			backtrace = [hex(a) for a in panda.callstack_callers(20, cpu)]
-			_do_taint_user_src(cpu, user_addr, sz, origin, backtrace)
+			_do_taint_user_src(cpu, user_addr, sz, origin, backtrace, cur_syscall.copy())
 			return
 
 		# -------- taint sinks (unchanged) ------------------------------
@@ -503,7 +527,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		print(f'[analysis1] on_ret: completing {entry["origin"]} to=0x{entry["to"]:x} n={entry["n"]} '
 		      + (f'from~0x{entry["from_base"]:x}' if entry["from_base"] else 'from=unknown'))
 		_do_taint_range(cpu, entry['to'], entry['n'], entry['origin'],
-		                entry['from_base'], entry['backtrace'])
+		                entry['from_base'], entry['backtrace'], entry.get('user_context'))
 
 	@panda.ppp("syscalls2", "on_sys_execve_enter")
 	def on_sys_execve_enter(cpu, pc, fname_ptr, argv_ptr, envp):
@@ -520,6 +544,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		print(f"[analysis1] repro execve detected: {fname} — enabling on_call/on_ret hooks")
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
+		panda.ppp("syscalls2", "on_all_sys_enter")(all_sysenter)
 		panda.disable_ppp("on_sys_execve_enter")
 
 	print(f'[analysis1] replay start: record={record}')
