@@ -43,7 +43,7 @@ cb_enabled = False
 
 expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|KDO|WARNING|INFO|protection fault|Rebooting in 86400 seconds|~ # )"
 expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|KDO|Rebooting in 86400 seconds|~ # )"
-expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|Rebooting in 86400 seconds|KDO:\s*([^()]*)\s*\(([^)]*)\))"
+expect_prompt="(REPRODUCER DID NOT CRASH|KCSAN|UBSAN|Rebooting in 86400 seconds|KDO:\s*([^()]*)\s*\(([^)]*)\)|Memory state around the buggy address)"
 
 # Installed into /usr/bin/rsync-repros inside the rootfs.
 # Usage: rsync-repros SRC DST

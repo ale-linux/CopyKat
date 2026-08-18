@@ -40,9 +40,9 @@ mem = "1G"
 # - nopti: share page tables between kernel and userspace, makes tracing easier
 # - nospectre_v2: disable RSB stuffing on context switches which confuses the
 #   callstack_instr plugin with many calls that never return
-extra_qemu_kernel_args = "-kernel {} -append \"root=/dev/sda rw init=/init nokaslr sysctl.kernel.randomize_va_space=0 mitigations=off\""
+extra_qemu_kernel_args = "-kernel {} -append \"root=/dev/sda rw init=/init nokaslr sysctl.kernel.randomize_va_space=0 mitigations=off console=ttyS0\""
 extra_qemu_machine_args = "-nographic -nodefaults"
-expect_prompt="(REPRODUCER DID NOT CRASH|KASAN|KCSAN|UBSAN|BUG|WARNING|INFO|protection fault)"
+expect_prompt="(REPRODUCER DID NOT CRASH|KASAN|KCSAN|UBSAN|BUG|WARNING|INFO|protection fault|Memory state around the buggy address)"
 
 # Short boot-script that sets up a minimal environment to run a reproducer on a key press
 ready_serial_signal = "READY TO RUN REPRO"
@@ -345,7 +345,8 @@ class Kernel:
             print(f"path.mnt_parent_offset = {mnt_parent_offset - mnt_offset}",file=info_file)
             print(f"path.mnt_mountpoint_offset = {mnt_mountpoint_offset - mnt_offset}",file=info_file)
 
-            # Offsets that no longer exist
+            # Offsets that no longer exist in 6.1+ kernels (maple tree replaced
+            # the mmap linked list); osi_linux reads these as OPTIONAL so -1 is safe.
             print("mm.mmap_offset = -1",file=info_file)
             print("vma.vm_next_offset = -1",file=info_file)
 
@@ -371,7 +372,8 @@ class Kernel:
                                                 "stack", "real_cred", "cred", "comm", "files",
                                                 "start_time"]),
                        "cred": ("cred", ["uid", "gid", "euid", "egid"]),
-                       "mm_struct": ("mm", ["pgd", "arg_start", "start_brk", "brk", "start_stack"]),
+                       "mm_struct": ("mm", ["pgd", "arg_start", "start_brk", "brk", "start_stack",
+                                            "mm_mt"]),
                        "vm_area_struct": ("vma", ["vm_mm", "vm_start", "vm_end", "vm_flags", "vm_file"]),
                        "file": ("fs", ["f_pos"]),
                        "files_struct": ("fs", ["fdt", "fdtab"]),
@@ -392,6 +394,27 @@ class Kernel:
                     if not offset and field in optional_fields.get(name, set()):
                         offset = "-1"
                     print(f"{short_name}.{field}_offset = {offset}",file=info_file)
+
+            # Maple-tree node layout — needed by the Python VMA walker for 6.1+ kernels.
+            # We query the actual offsets from the debug image rather than hardcoding
+            # them so this survives across kernel releases.
+            maple_offsets = {
+                # struct maple_tree
+                "mt.ma_root_offset":          ("(int)&((struct maple_tree*)0)->ma_root",),
+                # struct maple_range_64  (covers both leaf_64 and range_64 node types)
+                "mr64.pivot0_offset":         ("(int)&((struct maple_range_64*)0)->pivot[0]",),
+                "mr64.slot0_offset":          ("(int)&((struct maple_range_64*)0)->slot[0]",),
+                "mr64.meta_offset":           ("(int)&((struct maple_range_64*)0)->meta",),
+                "mr64.num_slots":             ("(int)(sizeof(((struct maple_range_64*)0)->slot)/sizeof(void*))",),
+                # struct maple_arange_64
+                "ma64.pivot0_offset":         ("(int)&((struct maple_arange_64*)0)->pivot[0]",),
+                "ma64.slot0_offset":          ("(int)&((struct maple_arange_64*)0)->slot[0]",),
+                "ma64.meta_offset":           ("(int)&((struct maple_arange_64*)0)->meta",),
+                "ma64.num_slots":             ("(int)(sizeof(((struct maple_arange_64*)0)->slot)/sizeof(void*))",),
+            }
+            for key, (expr,) in maple_offsets.items():
+                val = gdb_printf("%d", expr)
+                print(f"maple.{key} = {val}", file=info_file)
 
             gdbmi.exit()
             info_file.close()
