@@ -416,6 +416,29 @@ class Kernel:
                 val = gdb_printf("%d", expr)
                 print(f"maple.{key} = {val}", file=info_file)
 
+            # iov_iter layout — needed to resolve userspace source addresses
+            # inside _copy_from_iter callbacks.
+            iov_iter_offsets = {
+                # iter_type discriminant (u8)
+                "iter_type_offset":   ("(int)&((struct iov_iter*)0)->iter_type",),
+                # data_source flag (bool): 1 == ITER_SOURCE == user→kernel
+                "data_source_offset": ("(int)&((struct iov_iter*)0)->data_source",),
+                # iov_offset: how far into the current segment we already are
+                "iov_offset_offset":  ("(int)&((struct iov_iter*)0)->iov_offset",),
+                # __iov / ubuf union: pointer to iovec array (IOVEC) or ubuf pointer (UBUF)
+                "iov_base_offset":    ("(int)&((struct iov_iter*)0)->__iov",),
+                # count: remaining bytes in the iterator
+                "count_offset":       ("(int)&((struct iov_iter*)0)->count",),
+                # nr_segs: number of iovec segments remaining (IOVEC type)
+                "nr_segs_offset":     ("(int)&((struct iov_iter*)0)->nr_segs",),
+                # struct iovec field offsets
+                "iovec.iov_base_offset": ("(int)&((struct iovec*)0)->iov_base",),
+                "iovec.iov_len_offset":  ("(int)&((struct iovec*)0)->iov_len",),
+            }
+            for key, (expr,) in iov_iter_offsets.items():
+                val = gdb_printf("%d", expr)
+                print(f"iov_iter.{key} = {val}", file=info_file)
+
             gdbmi.exit()
             info_file.close()
 
