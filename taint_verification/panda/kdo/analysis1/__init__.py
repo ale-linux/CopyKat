@@ -183,12 +183,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				virt_addr = ptr + offset
 				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
 				# Check whether this byte already carries a taint label; skip if so.
-				existing = panda.taint_get_ram(taint_paddr)
-				if existing is not None:
-					existing_labels = existing.get_labels()  # consume iterator once
-					if existing_labels:
-						log(f'taint: skipping virt 0x{virt_addr:x} (phys 0x{taint_paddr:x}) — already labelled {existing_labels}')
-						continue
+				# existing = panda.taint_get_ram(taint_paddr)
+				# if existing is not None:
+				# 	existing_labels = existing.get_labels()  # consume iterator once
+				# 	if existing_labels:
+				# 		log(f'taint: skipping virt 0x{virt_addr:x} (phys 0x{taint_paddr:x}) — already labelled {existing_labels}')
+				# 		continue
 				# panda.plugins['taint2'].taint2_delete_ram(taint_paddr)
 				panda.taint_label_ram(taint_paddr, kdo_label_nr)
 				label_map[kdo_label_nr] = {
