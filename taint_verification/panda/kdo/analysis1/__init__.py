@@ -95,6 +95,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	panic_addr            = symbol_map.get('panic',             None).address
 	kdo_store_cb_sym      = symbol_map.get('kdo_store_callback', None)
 	kdo_store_cb_addr     = kdo_store_cb_sym.address if kdo_store_cb_sym else None
+	handle_mm_fault_sym   = symbol_map.get('handle_mm_fault', None)
+	handle_mm_fault_addr  = handle_mm_fault_sym.address if handle_mm_fault_sym else None
 
 	# syscall() wrapper in the statically-linked repro binary.
 	# The reproducer calls mmap via syscall(__NR_mmap, ...) so we intercept
@@ -119,6 +121,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	print(f'bitmap_ip_add kasan retaddr:{hex(bitmap_ip_add_kasan_retaddr) if bitmap_ip_add_kasan_retaddr else "NOT FOUND"}')
 	print(f'panic addr:                 {hex(panic_addr)}')
 	print(f'kdo_store_callback addr:    {hex(kdo_store_cb_addr) if kdo_store_cb_addr else "NOT FOUND"}')
+	print(f'handle_mm_fault addr:       {hex(handle_mm_fault_addr) if handle_mm_fault_addr else "NOT FOUND"}')
 
 	def log(s):
 		if enable_logging:
@@ -139,12 +142,119 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			return None
 		return result.get_labels()
 
+	PAGE_SIZE = 0x1000
+
+	# cpu_index -> fault address recorded at handle_mm_fault entry.
+	# Keyed by CPU index so that SMP replays (multiple vCPUs) don't clobber
+	# each other; in practice kdo replays are single-CPU, but the guard is free.
+	handle_mm_fault_pending = {}
+
+	# Pages that on_ret has classified as heap/anon and queued for taint labelling.
+	# on_ret fires from PANDA_CB_BEFORE_BLOCK_EXEC — the TB for the current
+	# iteration is *about to execute*, so calling taint_enable() there would set
+	# execute_llvm=1 before the TB is dispatched, crashing on assert(llvm_tc_ptr).
+	# on_call fires from PANDA_CB_AFTER_BLOCK_EXEC — the TB has already finished,
+	# so taint_enable() there is safe: tb_flush runs at the very next
+	# panda_callbacks_before_find_fast(), and tb_find then produces an LLVM TB.
+	# Each entry is (page_base, vma_snapshot) so on_call can do the taint work.
+	zero_page_pending = []
+
+	def on_ret(cpu, addr):
+		"""Hook on handle_mm_fault return.
+
+		When the kernel services a demand-paging fault for an anonymous heap/brk
+		VMA on behalf of the repro process, the zero-initialised page is now
+		physically backed and writable.  We assign one fresh taint label to every
+		byte of that page so that bytes which are never explicitly written by the
+		reproducer (i.e. they remain zero) are still tracked when they reach the
+		sink.  Any subsequent explicit store via kdo_store_callback will overwrite
+		this background label with a more specific one, which is the desired
+		behaviour.
+		"""
+		global kdo_label_nr
+
+		if handle_mm_fault_addr is None or addr != handle_mm_fault_addr:
+			return
+
+		cpu_idx = cpu.cpu_index
+		fault_addr = handle_mm_fault_pending.pop(cpu_idx, None)
+		if fault_addr is None:
+			# on_ret fired for handle_mm_fault but we never saw the matching
+			# on_call — most likely the hook was registered after the call was
+			# already in flight, or the fault was re-entered recursively.
+			print(f'[analysis1] on_ret(handle_mm_fault): no pending entry for cpu{cpu_idx}, skipping')
+			return
+
+		page_base = fault_addr & ~(PAGE_SIZE - 1)
+		print(f'[analysis1] on_ret(handle_mm_fault): cpu{cpu_idx} fault_addr=0x{fault_addr:x} page_base=0x{page_base:x}')
+
+		# Classify the faulted page using the cached VMA list.
+		# We only taint on-demand anonymous pages (heap / brk / plain anon).
+		# Stack and file-backed pages are excluded.
+		containing_vma = None
+		for mapping in pm.mappings:
+			if mapping['base'] <= page_base < mapping['base'] + mapping['size']:
+				containing_vma = mapping
+				break
+
+		if containing_vma is None:
+			print(f'[analysis1] on_ret(handle_mm_fault): page 0x{page_base:x} not found in cached mappings ({len(pm.mappings)} entries) — skipping')
+			return
+		if containing_vma['name'] not in ('[heap]', '[anon]'):
+			print(f'[analysis1] on_ret(handle_mm_fault): page 0x{page_base:x} in vma {containing_vma["name"]!r} — not heap/anon, skipping')
+			return
+
+		# Queue for taint labelling — do NOT call enable_taint() here.
+		# on_ret fires from BEFORE_BLOCK_EXEC; the TB is still about to run.
+		# enable_taint() sets execute_llvm=1 immediately, which would cause
+		# assert(llvm_tc_ptr) on the same TB before tb_flush can clear the cache.
+		# The work is drained by on_call which fires from AFTER_BLOCK_EXEC.
+		zero_page_pending.append((page_base, dict(containing_vma)))
+		print(f'[analysis1] on_ret(handle_mm_fault): queued page 0x{page_base:x} (vma {containing_vma["name"]}) for taint labelling')
+
 	def on_call(cpu, addr):
 		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
 
 		# Only care about calls from the reproducer process
 		pname = panda.get_process_name(cpu)
 		if not pattern.search(pname):
+			return
+
+		# Drain any pages queued by on_ret.  on_call fires from AFTER_BLOCK_EXEC
+		# so the current TB has already executed — safe to call enable_taint() and
+		# issue taint_label_ram() calls here.
+		while zero_page_pending:
+			page_base, vma = zero_page_pending.pop(0)
+			enable_taint()
+			label = kdo_label_nr
+			kdo_label_nr += 1
+			label_map[label] = {
+				'virt_addr': hex(page_base),
+				'backtrace': [],
+				'type': 'zero_page',
+			}
+			print(f'[analysis1] on_call drain: zero-page label {label} for page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]})')
+			untranslatable = 0
+			for offset in range(PAGE_SIZE):
+				virt_addr   = page_base + offset
+				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
+				if taint_paddr == 0xFFFFFFFFFFFFFFFF:
+					untranslatable += 1
+					log(f'taint: zero-page label {label}: virt 0x{virt_addr:x} not translatable, skipping')
+					continue
+				panda.taint_label_ram(taint_paddr, label)
+				log(f'taint: zero-page label {label} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
+			if untranslatable:
+				print(f'[analysis1] on_call drain: {untranslatable}/{PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}')
+			else:
+				print(f'[analysis1] on_call drain: labelled all {PAGE_SIZE} bytes of page 0x{page_base:x} with label {label}')
+
+		# handle_mm_fault(vma, address, flags, regs)
+		# x86_64 SysV ABI: arg0=rdi (vma), arg1=rsi (address)
+		if handle_mm_fault_addr is not None and addr == handle_mm_fault_addr:
+			fault_addr = panda.arch.get_arg(cpu, 1)
+			handle_mm_fault_pending[cpu.cpu_index] = fault_addr
+			print(f'[analysis1] on_call(handle_mm_fault): cpu{cpu.cpu_index} address=0x{fault_addr:x}')
 			return
 
 		if kdo_store_cb_addr is not None and addr == kdo_store_cb_addr:
@@ -290,8 +400,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		if not pattern.search(fname):
 			return
 
-		print(f"[analysis1] repro execve detected: {fname} — enabling on_call hook")
+		print(f"[analysis1] repro execve detected: {fname} — enabling on_call and on_ret hooks")
 		panda.ppp("callstack_instr", "on_call")(on_call)
+		panda.ppp("callstack_instr", "on_ret")(on_ret)
 		panda.disable_ppp("on_sys_execve_enter")
 
 	@panda.ppp("syscalls2", "on_all_sys_return")
