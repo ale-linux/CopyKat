@@ -401,13 +401,18 @@ class Kernel:
             maple_offsets = {
                 # struct maple_tree
                 "mt.ma_root_offset":          ("(int)&((struct maple_tree*)0)->ma_root",),
+                # struct maple_node dense layout (parent ptr + slot[])
+                "mn.slot0_offset":            ("(int)&((struct maple_node*)0)->slot[0]",),
+                "mn.num_slots":               ("(int)(sizeof(((struct maple_node*)0)->slot)/sizeof(void*))",),
                 # struct maple_range_64  (covers both leaf_64 and range_64 node types)
                 "mr64.pivot0_offset":         ("(int)&((struct maple_range_64*)0)->pivot[0]",),
+                "mr64.num_pivots":            ("(int)(sizeof(((struct maple_range_64*)0)->pivot)/sizeof(unsigned long))",),
                 "mr64.slot0_offset":          ("(int)&((struct maple_range_64*)0)->slot[0]",),
                 "mr64.meta_offset":           ("(int)&((struct maple_range_64*)0)->meta",),
                 "mr64.num_slots":             ("(int)(sizeof(((struct maple_range_64*)0)->slot)/sizeof(void*))",),
                 # struct maple_arange_64
                 "ma64.pivot0_offset":         ("(int)&((struct maple_arange_64*)0)->pivot[0]",),
+                "ma64.num_pivots":            ("(int)(sizeof(((struct maple_arange_64*)0)->pivot)/sizeof(unsigned long))",),
                 "ma64.slot0_offset":          ("(int)&((struct maple_arange_64*)0)->slot[0]",),
                 "ma64.meta_offset":           ("(int)&((struct maple_arange_64*)0)->meta",),
                 "ma64.num_slots":             ("(int)(sizeof(((struct maple_arange_64*)0)->slot)/sizeof(void*))",),

@@ -17,12 +17,12 @@ def compile_c_repro(path, do_bug, outdir, clang, pass_plugin):
         # Compile with clang and inject the kdo-store pass via -fpass-plugin.
         # -static keeps the same behaviour as the original gcc invocation.
         cmd = [
-            clang, '-static', '-x', 'c', '-O0',
+            clang, '-static', '-g', '-x', 'c', '-O0',
             f'-fpass-plugin={pass_plugin}',
             repro_c, '-o', repro_out_path,
         ]
     else:
-        cmd = [clang, '-static', '-x', 'c', '-O0', repro_c, '-o', repro_out_path]
+        cmd = [clang, '-static', '-g', '-x', 'c', '-O0', repro_c, '-o', repro_out_path]
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

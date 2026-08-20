@@ -43,14 +43,23 @@ class ProcessMappings:
         self._panda = panda
 
         # Maple-tree offsets
-        self._MM_MT_OFFSET      = ki['mm.mm_mt_offset']
-        self._MT_MA_ROOT_OFFSET = ki['maple.mt.ma_root_offset']
-        self._MR64_SLOT_OFFSET  = ki['maple.mr64.slot0_offset']
-        self._MR64_META_OFFSET  = ki['maple.mr64.meta_offset']
-        self._MR64_NUM_SLOTS    = ki['maple.mr64.num_slots']
-        self._MA64_SLOT_OFFSET  = ki['maple.ma64.slot0_offset']
-        self._MA64_META_OFFSET  = ki['maple.ma64.meta_offset']
-        self._MA64_NUM_SLOTS    = ki['maple.ma64.num_slots']
+        self._MM_MT_OFFSET       = ki['mm.mm_mt_offset']
+        self._MT_MA_ROOT_OFFSET  = ki['maple.mt.ma_root_offset']
+        # struct maple_node — dense layout
+        self._MN_SLOT0_OFFSET    = ki['maple.mn.slot0_offset']
+        self._MN_NUM_SLOTS       = ki['maple.mn.num_slots']
+        # struct maple_range_64 / maple_leaf_64
+        self._MR64_PIVOT0_OFFSET = ki['maple.mr64.pivot0_offset']
+        self._MR64_NUM_PIVOTS    = ki['maple.mr64.num_pivots']
+        self._MR64_SLOT_OFFSET   = ki['maple.mr64.slot0_offset']
+        self._MR64_META_OFFSET   = ki['maple.mr64.meta_offset']
+        self._MR64_NUM_SLOTS     = ki['maple.mr64.num_slots']
+        # struct maple_arange_64
+        self._MA64_PIVOT0_OFFSET = ki['maple.ma64.pivot0_offset']
+        self._MA64_NUM_PIVOTS    = ki['maple.ma64.num_pivots']
+        self._MA64_SLOT_OFFSET   = ki['maple.ma64.slot0_offset']
+        self._MA64_META_OFFSET   = ki['maple.ma64.meta_offset']
+        self._MA64_NUM_SLOTS     = ki['maple.ma64.num_slots']
 
         # vm_area_struct offsets
         self._VMA_VM_START = ki['vma.vm_start_offset']
@@ -71,6 +80,7 @@ class ProcessMappings:
         #: Most-recently refreshed list of mapping dicts.
         self.mappings = []
 
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -78,7 +88,6 @@ class ProcessMappings:
     def refresh(self, cpu):
         """Walk the maple tree of the current process and update ``self.mappings``."""
         panda = self._panda
-
         proc = panda.plugins['osi'].get_current_process(cpu)
         if proc == panda.ffi.NULL:
             self.mappings = []
@@ -101,7 +110,23 @@ class ProcessMappings:
             print(f'[analysis1] refresh: ma_root is NULL for {pname!r}')
             return
 
+        node_addr = self._mt_node_addr(ma_root)
         print(f'[analysis1] refresh: task=0x{task_addr:x} mm=0x{mm_ptr:x} ma_root=0x{ma_root:x} proc={pname!r}')
+
+        # DBG: dump the raw 256-byte maple node so we can see its actual contents
+        if self._DBG:
+            try:
+                raw_node = self._panda.virtual_memory_read(cpu, node_addr, 256)
+                hex_lines = []
+                for i in range(0, 256, 16):
+                    chunk = raw_node[i:i+16]
+                    hex_str = ' '.join(f'{b:02x}' for b in chunk)
+                    hex_lines.append(f'  {node_addr + i:016x}: {hex_str}')
+                print(f'[analysis1][dbg] raw node dump @ 0x{node_addr:x}:')
+                for line in hex_lines:
+                    print(line)
+            except Exception as e:
+                print(f'[analysis1][dbg] raw node dump failed: {e}')
 
         raw_vmas = []
         self._mt_walk_node(cpu, ma_root, mm_ptr, raw_vmas)
@@ -156,6 +181,10 @@ class ProcessMappings:
         """Read a vm_area_struct and return a mapping dict, or None if invalid."""
         vm_start = self._vmread64(cpu, vma_ptr + self._VMA_VM_START)
         vm_end   = self._vmread64(cpu, vma_ptr + self._VMA_VM_END)
+        self._dbg(
+            f'  _read_vma(0x{vma_ptr:x}): vm_start={hex(vm_start) if vm_start is not None else None}'
+            f' vm_end={hex(vm_end) if vm_end is not None else None}'
+        )
         if vm_start is None or vm_end is None:
             return None
         if vm_end <= vm_start:
@@ -192,6 +221,57 @@ class ProcessMappings:
             'file':  None,
         }
 
+    def _mr64_data_end(self, cpu, node_addr, type_name, depth):
+        """Mirror the kernel's ma_data_end() for maple_range_64 / maple_leaf_64.
+
+        The kernel decides the slot count as follows:
+          last_piv = pivot[num_pivots - 1]
+          if last_piv == 0:         return meta.end          (short/sparse node)
+          if last_piv == ULONG_MAX: return num_pivots - 1    (root whose range ends at ULONG_MAX)
+          else:                     return num_pivots         (mid-range node, all slots used)
+
+        Returns the number of slots to scan, or None on read failure.
+        """
+        num_pivots   = self._MR64_NUM_PIVOTS          # e.g. 15 for a 16-slot node
+        last_piv_off = self._MR64_PIVOT0_OFFSET + (num_pivots - 1) * 8
+        last_piv     = self._vmread64(cpu, node_addr + last_piv_off)
+        meta_end     = self._vmread8(cpu,  node_addr + self._MR64_META_OFFSET)
+
+        self._dbg(
+            f'walk depth={depth} {type_name} node=0x{node_addr:x}: '
+            f'last_pivot[{num_pivots-1}] @ +0x{last_piv_off:x} = '
+            f'{hex(last_piv) if last_piv is not None else None}, '
+            f'meta.end={meta_end!r} '
+            f'(pivot0=+{self._MR64_PIVOT0_OFFSET} num_pivots={num_pivots} '
+            f'slot0=+{self._MR64_SLOT_OFFSET} num_slots={self._MR64_NUM_SLOTS})'
+        )
+
+        if last_piv is None or meta_end is None:
+            self._dbg(f'walk depth={depth} {type_name}: read failure — aborting branch')
+            return None
+
+        ULONG_MAX = 0xffffffffffffffff
+        if last_piv == 0:
+            num_slots = min(meta_end + 1, self._MR64_NUM_SLOTS)
+            self._dbg(f'walk depth={depth} {type_name}: last_pivot=0 → meta_end={meta_end} → {num_slots} slot(s)')
+        elif last_piv == ULONG_MAX:
+            num_slots = num_pivots      # slots 0..num_pivots-1 (last slot is the ULONG_MAX sentinel range)
+            self._dbg(f'walk depth={depth} {type_name}: last_pivot=ULONG_MAX → {num_slots} slot(s)')
+        else:
+            num_slots = self._MR64_NUM_SLOTS   # all slots including the one past the last pivot
+            self._dbg(f'walk depth={depth} {type_name}: last_pivot=0x{last_piv:x} → full {num_slots} slot(s)')
+
+        return num_slots
+
+    # -----------------------------------------------------------------------
+    # DBG helpers — set _DBG = False to silence all maple-walk traces at once
+    # -----------------------------------------------------------------------
+    _DBG = True
+
+    def _dbg(self, msg):
+        if self._DBG:
+            print(f'[analysis1][dbg] {msg}')
+
     def _mt_walk_node(self, cpu, enode, mm_ptr, results, depth=0):
         """Recursively walk a maple tree node, collecting leaf VMA entries."""
         if depth > 64:
@@ -199,52 +279,88 @@ class ProcessMappings:
             return
 
         if enode is None or enode < 0x1000:
+            self._dbg(f'walk depth={depth}: enode={enode!r} below threshold, skipping')
             return
 
         node_type = self._mt_node_type(enode)
         node_addr = self._mt_node_addr(enode)
 
+        self._dbg(
+            f'walk depth={depth}: enode=0x{enode:x} '
+            f'node_type={node_type} node_addr=0x{node_addr:x}'
+        )
+
         if node_addr < 0x1000:
+            self._dbg(f'walk depth={depth}: node_addr too small, skipping')
             return
 
         if node_type == self._MTYPE_DENSE and depth == 0:
+            # Single-entry root: enode IS the raw VMA pointer (no node wrapper)
+            self._dbg(f'walk depth=0 DENSE: treating enode 0x{enode:x} as direct VMA ptr')
             entry = self._read_vma(cpu, enode, mm_ptr)
+            self._dbg(f'walk depth=0 DENSE: _read_vma → {entry}')
             if entry:
                 results.append(entry)
             return
 
         if node_type == self._MTYPE_DENSE:
-            for i in range(31):
-                slot_val = self._vmread64(cpu, node_addr + 8 + i * 8)
+            self._dbg(f'walk depth={depth} DENSE node at 0x{node_addr:x}: scanning {self._MN_NUM_SLOTS} slots')
+            for i in range(self._MN_NUM_SLOTS):
+                slot_addr = node_addr + self._MN_SLOT0_OFFSET + i * 8
+                slot_val = self._vmread64(cpu, slot_addr)
+                self._dbg(f'  dense slot[{i}] @ 0x{slot_addr:x} = {hex(slot_val) if slot_val is not None else None}')
                 if slot_val and slot_val >= 0x1000:
                     entry = self._read_vma(cpu, slot_val, mm_ptr)
+                    self._dbg(f'  dense slot[{i}]: _read_vma → {entry}')
                     if entry:
                         results.append(entry)
 
         elif node_type in (self._MTYPE_LEAF_64, self._MTYPE_RANGE_64):
-            meta_end = self._vmread8(cpu, node_addr + self._MR64_META_OFFSET)
-            if meta_end is None:
+            type_name = 'LEAF_64' if node_type == self._MTYPE_LEAF_64 else 'RANGE_64'
+            num_slots = self._mr64_data_end(cpu, node_addr, type_name, depth)
+            if num_slots is None:
                 return
-            num_slots = min(meta_end + 1, self._MR64_NUM_SLOTS)
             for i in range(num_slots):
-                slot_val = self._vmread64(cpu, node_addr + self._MR64_SLOT_OFFSET + i * 8)
+                slot_addr = node_addr + self._MR64_SLOT_OFFSET + i * 8
+                slot_val = self._vmread64(cpu, slot_addr)
+                self._dbg(
+                    f'  {type_name} slot[{i}] @ 0x{slot_addr:x} = '
+                    f'{hex(slot_val) if slot_val is not None else None}'
+                )
                 if not slot_val or slot_val < 0x1000:
+                    self._dbg(f'  {type_name} slot[{i}]: null/small, skipping')
                     continue
                 if self._mt_is_leaf(node_type):
                     entry = self._read_vma(cpu, slot_val, mm_ptr)
+                    self._dbg(f'  {type_name} slot[{i}]: _read_vma(0x{slot_val:x}) → {entry}')
                     if entry:
                         results.append(entry)
                 else:
                     self._mt_walk_node(cpu, slot_val, mm_ptr, results, depth + 1)
 
         elif node_type == self._MTYPE_ARANGE64:
-            meta_end = self._vmread8(cpu, node_addr + self._MA64_META_OFFSET)
+            # arange_64 always uses meta.end (ma_data_end returns it unconditionally)
+            meta_addr = node_addr + self._MA64_META_OFFSET
+            meta_end = self._vmread8(cpu, meta_addr)
+            self._dbg(
+                f'walk depth={depth} ARANGE64 node=0x{node_addr:x}: '
+                f'meta @ 0x{meta_addr:x} → meta_end={meta_end!r} '
+                f'(MA64_META_OFFSET={self._MA64_META_OFFSET}, MA64_NUM_SLOTS={self._MA64_NUM_SLOTS})'
+            )
             if meta_end is None:
+                self._dbg(f'walk depth={depth} ARANGE64: meta_end read failed — aborting branch')
                 return
             num_slots = min(meta_end + 1, self._MA64_NUM_SLOTS)
+            self._dbg(f'walk depth={depth} ARANGE64: scanning {num_slots} slot(s)')
             for i in range(num_slots):
-                slot_val = self._vmread64(cpu, node_addr + self._MA64_SLOT_OFFSET + i * 8)
+                slot_addr = node_addr + self._MA64_SLOT_OFFSET + i * 8
+                slot_val = self._vmread64(cpu, slot_addr)
+                self._dbg(
+                    f'  ARANGE64 slot[{i}] @ 0x{slot_addr:x} = '
+                    f'{hex(slot_val) if slot_val is not None else None}'
+                )
                 if not slot_val or slot_val < 0x1000:
+                    self._dbg(f'  ARANGE64 slot[{i}]: null/small, skipping')
                     continue
                 self._mt_walk_node(cpu, slot_val, mm_ptr, results, depth + 1)
 

@@ -61,7 +61,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				  extra_args=conf["extra_qemu_machine_args"],
 				  os_version="linux-64-linux:1.0")
 
-	panda.load_plugin("taint2", args={"opt": True})
+	panda.load_plugin("taint2", args={"opt": True, "no_tp": True})
 	panda.load_plugin("osi", args={"disable-autoload": True})
 	panda.load_plugin("osi_linux", args={
 		"kconf_file": kernel.info_path, "kconf_group": "linux:1.0:64"
@@ -75,7 +75,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	print(
 		f'[analysis1] VMA walker offsets: '
 		f'mm_mt={pm._MM_MT_OFFSET} ma_root={pm._MT_MA_ROOT_OFFSET} '
+		f'mn_slot0={pm._MN_SLOT0_OFFSET} mn_slots={pm._MN_NUM_SLOTS} '
+		f'mr64_pivot0={pm._MR64_PIVOT0_OFFSET} mr64_num_pivots={pm._MR64_NUM_PIVOTS} '
 		f'mr64_slot={pm._MR64_SLOT_OFFSET} mr64_meta={pm._MR64_META_OFFSET} mr64_slots={pm._MR64_NUM_SLOTS} '
+		f'ma64_pivot0={pm._MA64_PIVOT0_OFFSET} ma64_num_pivots={pm._MA64_NUM_PIVOTS} '
 		f'ma64_slot={pm._MA64_SLOT_OFFSET} ma64_meta={pm._MA64_META_OFFSET} ma64_slots={pm._MA64_NUM_SLOTS} '
 		f'vma_start={pm._VMA_VM_START} vma_end={pm._VMA_VM_END} vma_flags={pm._VMA_VM_FLAGS} vma_file={pm._VMA_VM_FILE} '
 		f'task_mm={pm._TASK_MM} f_path_dentry={pm._F_PATH_DENTRY} d_iname={pm._D_INAME}'
@@ -95,6 +98,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	panic_addr            = symbol_map.get('panic',             None).address
 	kdo_store_cb_sym      = symbol_map.get('kdo_store_callback', None)
 	kdo_store_cb_addr     = kdo_store_cb_sym.address if kdo_store_cb_sym else None
+	sink_sym              = symbol_map.get('sink', None)
+	sink_addr             = sink_sym.address if sink_sym else None
 	handle_mm_fault_sym   = symbol_map.get('handle_mm_fault', None)
 	handle_mm_fault_addr  = handle_mm_fault_sym.address if handle_mm_fault_sym else None
 
@@ -121,6 +126,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	print(f'bitmap_ip_add kasan retaddr:{hex(bitmap_ip_add_kasan_retaddr) if bitmap_ip_add_kasan_retaddr else "NOT FOUND"}')
 	print(f'panic addr:                 {hex(panic_addr)}')
 	print(f'kdo_store_callback addr:    {hex(kdo_store_cb_addr) if kdo_store_cb_addr else "NOT FOUND"}')
+	print(f'sink addr:                  {hex(sink_addr) if sink_addr else "NOT FOUND"}')
 	print(f'handle_mm_fault addr:       {hex(handle_mm_fault_addr) if handle_mm_fault_addr else "NOT FOUND"}')
 
 	def log(s):
@@ -159,6 +165,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	# Each entry is (page_base, vma_snapshot) so on_call can do the taint work.
 	zero_page_pending = []
 
+	# Set to True by on_sys_mmap_return when a new mapping was created.
+	# on_call drains this flag and refreshes pm — by that point the kernel has
+	# fully committed the maple-tree rewrite and returned to user space, so the
+	# tree is stable and readable.
+	refresh_pending = False
+
 	def on_ret(cpu, addr):
 		"""Hook on handle_mm_fault return.
 
@@ -191,6 +203,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		# Classify the faulted page using the cached VMA list.
 		# We only taint on-demand anonymous pages (heap / brk / plain anon).
 		# Stack and file-backed pages are excluded.
+		# Force a fresh walk of the maple tree so that a VMA created by this
+		# very fault (e.g. first access to a new anonymous mapping) is visible.
+		pm.refresh(cpu)
 		containing_vma = None
 		for mapping in pm.mappings:
 			if mapping['base'] <= page_base < mapping['base'] + mapping['size']:
@@ -214,11 +229,20 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 
 	def on_call(cpu, addr):
 		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
+		nonlocal refresh_pending
 
 		# Only care about calls from the reproducer process
 		pname = panda.get_process_name(cpu)
 		if not pattern.search(pname):
 			return
+
+		# Drain a deferred pm.refresh() requested by on_sys_mmap_return.
+		# on_call fires from AFTER_BLOCK_EXEC — the first user-space TB after the
+		# syscall return has already fully executed, so the kernel's maple-tree
+		# rewrite is complete and the tree is stable to read.
+		if refresh_pending:
+			refresh_pending = False
+			pm.refresh(cpu)
 
 		# Drain any pages queued by on_ret.  on_call fires from AFTER_BLOCK_EXEC
 		# so the current TB has already executed — safe to call enable_taint() and
@@ -226,28 +250,29 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		while zero_page_pending:
 			page_base, vma = zero_page_pending.pop(0)
 			enable_taint()
-			label = kdo_label_nr
-			kdo_label_nr += 1
-			label_map[label] = {
-				'virt_addr': hex(page_base),
-				'backtrace': [],
-				'type': 'zero_page',
-			}
-			print(f'[analysis1] on_call drain: zero-page label {label} for page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]})')
+			first_label = kdo_label_nr
+			print(f'[analysis1] on_call drain: zero-page labels starting at {first_label} for page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]})')
 			untranslatable = 0
 			for offset in range(PAGE_SIZE):
 				virt_addr   = page_base + offset
 				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
 				if taint_paddr == 0xFFFFFFFFFFFFFFFF:
 					untranslatable += 1
-					log(f'taint: zero-page label {label}: virt 0x{virt_addr:x} not translatable, skipping')
+					log(f'taint: zero-page virt 0x{virt_addr:x} not translatable, skipping')
 					continue
-				panda.taint_label_ram(taint_paddr, label)
-				log(f'taint: zero-page label {label} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
+				label_map[kdo_label_nr] = {
+					'virt_addr': hex(virt_addr),
+					'backtrace': [],
+					'type': 'zero_page',
+				}
+				panda.taint_label_ram(taint_paddr, kdo_label_nr)
+				log(f'taint: zero-page label {kdo_label_nr} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
+				kdo_label_nr += 1
+			last_label = kdo_label_nr - 1
 			if untranslatable:
-				print(f'[analysis1] on_call drain: {untranslatable}/{PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}')
+				print(f'[analysis1] on_call drain: {untranslatable}/{PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}; labels {first_label}..{last_label}')
 			else:
-				print(f'[analysis1] on_call drain: labelled all {PAGE_SIZE} bytes of page 0x{page_base:x} with label {label}')
+				print(f'[analysis1] on_call drain: labelled all {PAGE_SIZE} bytes of page 0x{page_base:x} with labels {first_label}..{last_label}')
 
 		# handle_mm_fault(vma, address, flags, regs)
 		# x86_64 SysV ABI: arg0=rdi (vma), arg1=rsi (address)
@@ -280,34 +305,69 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 					break
 
 			if heap_mapping is None:
+				# Diagnose why we skipped: find which mapping (if any) contains ptr
+				# and report whether it was absent or present-but-not-heap.
+				containing = None
+				for mapping in pm.mappings:
+					if mapping['base'] <= ptr < mapping['base'] + mapping['size']:
+						containing = mapping
+						break
+				if containing is None:
+					print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, len={length}) — ptr not in any known mapping ({len(pm.mappings)} entries), skipping taint')
+				else:
+					print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, len={length}) — ptr in mapping {containing["name"]!r} 0x{containing["base"]:x}+{containing["size"]} but is_heap=False, skipping taint')
 				return
 
 			print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, len={length}) — in heap mapping 0x{heap_mapping["base"]:x}+{heap_mapping["size"]}, tainting')
-
-			# Label each byte with a fresh unique label if not already tainted.
-			# (Deleting existing taint before re-labelling is disabled so that
-			#  previously assigned labels are preserved.)
+	
+			# All bytes from a single kdo_store_callback call share one label so
+			# that the call site is the unit of taint granularity, not the byte.
 			enable_taint()
 			backtrace = [hex(a) for a in panda.callstack_callers(20, cpu)]
+			call_label = kdo_label_nr
+			kdo_label_nr += 1
+			label_map[call_label] = {
+				'virt_addr': hex(ptr),
+				'len': length,
+				'backtrace': backtrace,
+			}
 			for offset in range(length):
 				virt_addr = ptr + offset
 				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
-				# Check whether this byte already carries a taint label; skip if so.
-				# existing = panda.taint_get_ram(taint_paddr)
-				# if existing is not None:
-				# 	existing_labels = existing.get_labels()  # consume iterator once
-				# 	if existing_labels:
-				# 		log(f'taint: skipping virt 0x{virt_addr:x} (phys 0x{taint_paddr:x}) — already labelled {existing_labels}')
-				# 		continue
-				# panda.plugins['taint2'].taint2_delete_ram(taint_paddr)
-				panda.taint_label_ram(taint_paddr, kdo_label_nr)
-				label_map[kdo_label_nr] = {
-					'virt_addr': hex(virt_addr),
-					'backtrace': backtrace,
-				}
-				log(f'taint: label {kdo_label_nr} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
-				kdo_label_nr += 1
-			print(f'[analysis1]   tainted {length} bytes, labels {kdo_label_nr - length}..{kdo_label_nr - 1}')
+				panda.taint_label_ram(taint_paddr, call_label)
+				log(f'taint: label {call_label} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
+			print(f'[analysis1]   tainted {length} bytes with label {call_label}')
+			return
+
+		if sink_addr is not None and addr == sink_addr:
+			# void sink(char *ptr, int len)
+			# x86_64 SysV ABI: arg0=rdi (ptr), arg1=rsi (len, signed 32-bit)
+			ptr    = panda.arch.get_arg(cpu, 0)
+			length = panda.arch.get_arg(cpu, 1)
+			length = length if length < (1 << 31) else length - (1 << 32)
+
+			print(f'[analysis1] sink(ptr=0x{ptr:x}, len={length}) — checking taint')
+
+			tainted_bytes = {}
+			if length > 0:
+				for offset in range(length):
+					labels = get_taint_labels(cpu, ptr + offset)
+					if labels:
+						resolved = [label_map[l] for l in labels if l in label_map]
+						tainted_bytes[offset] = resolved
+						log(f'  taint: sink ptr[{offset}] @ 0x{ptr + offset:x} labels={labels} resolved={resolved}')
+
+			if tainted_bytes:
+				print(f'[analysis1] sink: tainted bytes: {tainted_bytes}')
+			else:
+				print(f'[analysis1] sink: no taint on sink bytes (ptr=0x{ptr:x}, len={length})')
+
+			analysis['sink'] = {
+				'ptr': hex(ptr),
+				'len': length,
+				'tainted_bytes': tainted_bytes,
+			}
+			panda.end_analysis()
 			return
 
 		if addr == panic_addr:
@@ -405,12 +465,40 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
 		panda.disable_ppp("on_sys_execve_enter")
 
-	@panda.ppp("syscalls2", "on_all_sys_return")
-	def on_all_sys_return(cpu, pc, callno):
-		pname = panda.get_process_name(cpu)
-		if not pattern.search(pname):
+	@panda.ppp("syscalls2", "on_sys_mmap_enter")
+	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
+		if not pattern.search(panda.get_process_name(cpu)):
 			return
-		pm.refresh(cpu)
+		print(
+			f'[analysis1] mmap enter: hint=0x{addr_hint:x} len=0x{length:x} '
+			f'prot=0x{prot:x} flags=0x{flags:x} fd={fd} offset=0x{offset:x}'
+		)
+
+	@panda.ppp("syscalls2", "on_sys_mmap_return")
+	def on_sys_mmap_return(cpu, pc, addr_hint, length, prot, flags, fd, offset):
+		nonlocal refresh_pending
+		if not pattern.search(panda.get_process_name(cpu)):
+			return
+		ret = panda.arch.get_retval(cpu)
+		print(
+			f'[analysis1] mmap return: addr=0x{ret:x} '
+			f'(hint=0x{addr_hint:x} len=0x{length:x} '
+			f'prot=0x{prot:x} flags=0x{flags:x} fd={fd} offset=0x{offset:x})'
+		)
+		# Don't refresh here — the kernel's maple-tree rewrite may not be fully
+		# committed yet at the syscall-return boundary. Set a flag so on_call
+		# refreshes on the next user-space instruction instead.
+		refresh_pending = True
+
+	@panda.ppp("syscalls2", "on_sys_brk_return")
+	def on_sys_brk_return(cpu, pc, brk):
+		nonlocal refresh_pending
+		if not pattern.search(panda.get_process_name(cpu)):
+			return
+		ret = panda.arch.get_retval(cpu)
+		print(f'[analysis1] brk return: new_brk=0x{ret:x} (requested=0x{brk:x})')
+		# Same reasoning as mmap: defer the refresh to on_call.
+		refresh_pending = True
 
 	print(f'[analysis1] replay start: record={record}')
 	try:
