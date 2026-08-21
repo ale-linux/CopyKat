@@ -258,7 +258,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
 				if taint_paddr == 0xFFFFFFFFFFFFFFFF:
 					untranslatable += 1
-					log(f'taint: zero-page virt 0x{virt_addr:x} not translatable, skipping')
 					continue
 				label_map[kdo_label_nr] = {
 					'virt_addr': hex(virt_addr),
@@ -266,7 +265,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 					'type': 'zero_page',
 				}
 				panda.taint_label_ram(taint_paddr, kdo_label_nr)
-				log(f'taint: zero-page label {kdo_label_nr} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
 				kdo_label_nr += 1
 			last_label = kdo_label_nr - 1
 			if untranslatable:
@@ -292,11 +290,34 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			length = length if length < (1 << 31) else length - (1 << 32)
 
 			if length <= 0:
+				log(f'kdo_store_cb id={store_id} ptr=0x{ptr:x} len={length} SKIP:non-positive-len')
 				return
 
-			# print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, len={length})')
-
 			store_end = ptr + length
+
+			# Find which VMA contains ptr (start of range only, for diagnosis).
+			containing = None
+			for mapping in pm.mappings:
+				if mapping['base'] <= ptr < mapping['base'] + mapping['size']:
+					containing = mapping
+					break
+
+			is_h  = ProcessMappings.is_heap(containing) if containing else False
+			fits  = (containing is not None and store_end <= containing['base'] + containing['size'])
+			log(
+				f'kdo_store_cb id={store_id} ptr=0x{ptr:x} len={length}'
+				f' taint_enabled={panda.taint_enabled()}'
+				+ (
+					f' mapping={containing["name"]!r} 0x{containing["base"]:x}+0x{containing["size"]:x}'
+					f' is_heap={is_h} fits={fits}'
+					if containing else
+					f' mapping=NONE (total={len(pm.mappings)})'
+				)
+				+ (
+					' -> WILL_TAINT' if (is_h and fits) else ' -> SKIP'
+				)
+			)
+
 			heap_mapping = None
 			for mapping in pm.mappings:
 				mapping_end = mapping['base'] + mapping['size']
@@ -335,7 +356,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				virt_addr = ptr + offset
 				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
 				panda.taint_label_ram(taint_paddr, call_label)
-				log(f'taint: label {call_label} -> virt 0x{virt_addr:x} (phys 0x{taint_paddr:x})')
 			print(f'[analysis1]   tainted {length} bytes with label {call_label}')
 			return
 
@@ -419,30 +439,57 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			kasan_check_write_hit_ctr += 1
 
 			if is_target:
-				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('bitmap_ip_add_kasan_check_writes', [])) + 1} at memcpy call #{kasan_check_write_hit_ctr} ***")
-				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_copy_to_urb={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
-				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_copy_to_urb={is_target}):')
+				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('bitmap_ip_add_kasan_check_writes', [])) + 1} at kasan_check_write call #{kasan_check_write_hit_ctr} ***")
+				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
+				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
 
-				ptr = panda.arch.get_arg(cpu, 0)
+				ptr  = panda.arch.get_arg(cpu, 0)
 				size = panda.arch.get_arg(cpu, 1)
-				tainted_bytes = {}
-				for offset in range(size):
-					labels = get_taint_labels(cpu, ptr + offset)
+				log(f'  dst=0x{ptr:x} size={size} (store not yet executed — checking source value slots)')
+
+				# At kasan_check_write entry the store hasn't happened yet, so
+				# ptr (the destination) is untainted by definition.  The value
+				# about to be written lives in bitmap_ip_add's stack frame:
+				#   call site +955 (bytes  counter): value in 0x10(%rsp)
+				#   call site +905 (packets counter): value in 0x08(%rsp)
+				# We check both slots: whichever holds 0xdeadbeefc00ffeee is
+				# the one being written.
+				rsp = panda.arch.get_reg(cpu, 'rsp')
+				tainted_src = {}
+				for slot_name, slot_off in [('rsp+0x08', 0x08), ('rsp+0x10', 0x10)]:
+					vaddr = rsp + slot_off
+					try:
+						raw = panda.virtual_memory_read(cpu, vaddr, 8)
+						val = int.from_bytes(raw, 'little')
+					except Exception as e:
+						log(f'  {slot_name}=0x{vaddr:x} unreadable: {e}')
+						continue
+					paddr = panda.virt_to_phys(cpu, vaddr)
+					if paddr == 0xFFFFFFFFFFFFFFFF:
+						log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} not translatable')
+						continue
+					result = panda.taint_get_ram(paddr)
+					labels = result.get_labels() if result is not None else set()
+					resolved = [label_map[l] for l in labels if l in label_map]
+					log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} labels={labels} resolved={resolved}')
 					if labels:
-						resolved = [label_map[l] for l in labels if l in label_map]
-						tainted_bytes[offset] = resolved
-						log(f'  taint: from[{offset}] @ 0x{ptr + offset:x} labels={labels} resolved={resolved}')
-				if tainted_bytes:
-					print(f'[analysis1]   tainted write bytes: {tainted_bytes}')
+						tainted_src[slot_name] = {
+							'val': hex(val),
+							'labels': list(labels),
+							'resolved': resolved,
+						}
+
+				if tainted_src:
+					print(f'[analysis1]   tainted source slots: {tainted_src}')
 				else:
-					print(f'[analysis1]   no taint on write bytes (from=0x{ptr:x}, size={size})')
+					print(f'[analysis1]   no taint on source value slots (rsp=0x{rsp:x})')
 
 				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append({
 					'hit': kasan_check_write_hit_ctr,
 					'backtrace': [hex(a) for a in callers],
-					'from': hex(ptr),
+					'ptr': hex(ptr),
 					'size': size,
-					'tainted_bytes': tainted_bytes,
+					'tainted_src': tainted_src,
 				})
 				return
 
@@ -464,6 +511,49 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
 		panda.disable_ppp("on_sys_execve_enter")
+
+	@panda.ppp("syscalls2", "on_sys_sendmsg_enter")
+	def on_sys_sendmsg_enter(cpu, pc, fd, msg_ptr, flags):
+		if not pattern.search(panda.get_process_name(cpu)):
+			return
+		if not panda.taint_enabled():
+			return
+		try:
+			# struct msghdr: first two fields are msg_name (ptr, 8B) + msg_namelen (u32, 4B)
+			# then msg_iov (ptr, 8B) at offset 16, msg_iovlen (size_t, 8B) at offset 24
+			# struct iovec: iov_base (ptr, 8B) + iov_len (size_t, 8B)
+			msg_iov_ptr  = panda.virtual_memory_read(cpu, msg_ptr + 16, 8)
+			iov_ptr      = int.from_bytes(msg_iov_ptr, 'little')
+			iov_base_raw = panda.virtual_memory_read(cpu, iov_ptr, 8)
+			iov_len_raw  = panda.virtual_memory_read(cpu, iov_ptr + 8, 8)
+			iov_base = int.from_bytes(iov_base_raw, 'little')
+			iov_len  = int.from_bytes(iov_len_raw,  'little')
+		except Exception as e:
+			print(f'[analysis1] sendmsg: failed to read msghdr/iovec: {e}')
+			return
+
+		# Scan the nlh buffer for tainted bytes and report.
+		tainted = {}
+		for offset in range(min(iov_len, 1024)):
+			labels = get_taint_labels(cpu, iov_base + offset)
+			if labels:
+				resolved = [label_map[l] for l in labels if l in label_map]
+				tainted[offset] = {'labels': list(labels), 'resolved': resolved}
+
+		if tainted:
+			msg = (
+				f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: '
+				f'TAINTED {len(tainted)}/{iov_len} bytes'
+			)
+			print(f'[analysis1] {msg}')
+			log(msg)
+			for off, info in tainted.items():
+				entry = f'  [{off}] @ 0x{iov_base+off:x} labels={info["labels"]} resolved={info["resolved"]}'
+				log(entry)
+		else:
+			msg = f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: no taint on nlh buffer'
+			print(f'[analysis1] {msg}')
+			log(msg)
 
 	@panda.ppp("syscalls2", "on_sys_mmap_enter")
 	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
