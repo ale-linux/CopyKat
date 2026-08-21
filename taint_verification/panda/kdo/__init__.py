@@ -269,6 +269,38 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 			if matched:
 				f.write(matched.encode('utf-8', errors='replace'))
 				f.flush()
+			# If the sentinel was a KASAN report rather than the clean-exit line,
+			# the KASAN report body (dump_stack, shadow dump, …) plus the actual
+			# OOB store still need to execute in the emulator — that can take many
+			# seconds under PANDA.  Keep draining serial output until we have seen
+			# no new bytes for IDLE_TIMEOUT seconds, then stop.
+			if matched and matched != 'REPRODUCER DID NOT CRASH':
+				IDLE_TIMEOUT = 30
+				print(f"[kdo] KASAN sentinel — draining serial (idle timeout={IDLE_TIMEOUT}s)...")
+				last_rx = time.monotonic()
+				# _serial_read_until_streaming saves bytes that arrived in the
+				# same recv() call as the sentinel into serial_unconsumed_data.
+				# Write those out first so there is no gap between the sentinel
+				# line and the rest of the KASAN report.
+				if panda.serial_unconsumed_data:
+					f.write(panda.serial_unconsumed_data)
+					f.flush()
+					panda.serial_unconsumed_data = b''
+					last_rx = time.monotonic()
+				while True:
+					remaining = IDLE_TIMEOUT - (time.monotonic() - last_rx)
+					if remaining <= 0:
+						break
+					r, _, _ = select.select([panda.serial_socket], [], [], remaining)
+					if not r:
+						break
+					data = panda.serial_socket.recv(65535)
+					if not data:
+						break
+					f.write(data)
+					f.flush()
+					last_rx = time.monotonic()
+				print(f"[kdo] post-KASAN serial drain complete (idle {IDLE_TIMEOUT}s)")
 
 		status = RecordStatus.CRASH if matched != 'REPRODUCER DID NOT CRASH' else RecordStatus.NO_CRASH
 		print(f'[kdo] __record: sentinel matched={matched!r}, status={status}')

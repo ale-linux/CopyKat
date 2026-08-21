@@ -23,7 +23,6 @@ from .mappings import ProcessMappings
 analysis = dict()
 memcpy_hit_ctr = 0
 kasan_check_write_hit_ctr = 0
-kdo_label_nr = 1
 
 
 def _load_kernelinfo(path):
@@ -116,6 +115,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	# the stack (what callstack_instr exposes as the immediate caller) is the
 	# next instruction: copy_to_urb+0x309.
 	copy_to_urb_memcpy_retaddr = copy_to_urb_addr + 0x309 if copy_to_urb_addr is not None else None
+	# The OOB store gated by __kasan_check_write is at bitmap_ip_add+0x3bf; the
+	# return address (immediate caller seen by callstack_instr) is +0x3c0.
 	bitmap_ip_add_kasan_retaddr = bitmap_ip_add_addr + 0x3c0 if bitmap_ip_add_addr is not None else None
 
 	print(f'__asan_memcpy addr:         {hex(asan_memcpy_addr)}')
@@ -133,9 +134,35 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		if enable_logging:
 			print(s, file=outfile)
 
+	label_nr = 1
+
 	def enable_taint():
 		if not panda.taint_enabled():
 			panda.taint_enable()
+
+	def taint_label_range(cpu, base, length, label_entry):
+		"""Assign a fresh label to translatable bytes in `length` bytes starting
+		at virtual address `base`. `label_entry` is stored in label_map under that
+		label iff at least one byte was translated and tainted.
+		Assumes taint is already enabled.
+		Returns (label_or_none, untranslatable_bytes)."""
+		nonlocal label_nr
+		translated_paddrs = []
+		untranslatable = 0
+		for offset in range(length):
+			taint_paddr = panda.virt_to_phys(cpu, base + offset)
+			if taint_paddr == 0xFFFFFFFFFFFFFFFF:
+				untranslatable += 1
+				continue
+			translated_paddrs.append(taint_paddr)
+		if not translated_paddrs:
+			return None, untranslatable
+		label = label_nr
+		label_nr += 1
+		label_map[label] = label_entry
+		for taint_paddr in translated_paddrs:
+			panda.taint_label_ram(taint_paddr, label)
+		return label, untranslatable
 
 	def get_taint_labels(cpu, addr):
 		"""Return the set of taint labels on the byte at virtual address `addr`,
@@ -183,8 +210,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		this background label with a more specific one, which is the desired
 		behaviour.
 		"""
-		global kdo_label_nr
-
 		if handle_mm_fault_addr is None or addr != handle_mm_fault_addr:
 			return
 
@@ -228,7 +253,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		print(f'[analysis1] on_ret(handle_mm_fault): queued page 0x{page_base:x} (vma {containing_vma["name"]}) for taint labelling')
 
 	def on_call(cpu, addr):
-		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
+		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis
 		nonlocal refresh_pending
 
 		# Only care about calls from the reproducer process
@@ -250,27 +275,33 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		while zero_page_pending:
 			page_base, vma = zero_page_pending.pop(0)
 			enable_taint()
-			first_label = kdo_label_nr
-			print(f'[analysis1] on_call drain: zero-page labels starting at {first_label} for page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]})')
-			untranslatable = 0
+			# Each byte of a zero page gets its own label so that individual
+			# bytes that are never overwritten by kdo_store_callback can still
+			# be identified at the sink.
+			first_label = None
+			last_label = None
+			total_untranslatable = 0
+			translated = 0
 			for offset in range(PAGE_SIZE):
-				virt_addr   = page_base + offset
-				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
-				if taint_paddr == 0xFFFFFFFFFFFFFFFF:
-					untranslatable += 1
-					continue
-				label_map[kdo_label_nr] = {
+				virt_addr = page_base + offset
+				label, untranslatable = taint_label_range(cpu, virt_addr, 1, {
 					'virt_addr': hex(virt_addr),
 					'backtrace': [],
 					'type': 'zero_page',
-				}
-				panda.taint_label_ram(taint_paddr, kdo_label_nr)
-				kdo_label_nr += 1
-			last_label = kdo_label_nr - 1
-			if untranslatable:
-				print(f'[analysis1] on_call drain: {untranslatable}/{PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}; labels {first_label}..{last_label}')
+				})
+				total_untranslatable += untranslatable
+				if label is None:
+					continue
+				translated += 1
+				if first_label is None:
+					first_label = label
+				last_label = label
+			if translated == 0:
+				print(f'[analysis1] on_call drain: all {PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}; no labels created')
+			elif total_untranslatable:
+				print(f'[analysis1] on_call drain: {total_untranslatable}/{PAGE_SIZE} bytes untranslatable for page 0x{page_base:x}; labels {first_label}..{last_label} ({translated} used)')
 			else:
-				print(f'[analysis1] on_call drain: labelled all {PAGE_SIZE} bytes of page 0x{page_base:x} with labels {first_label}..{last_label}')
+				print(f'[analysis1] on_call drain: labelled all {PAGE_SIZE} bytes of page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]}) with labels {first_label}..{last_label}')
 
 		# handle_mm_fault(vma, address, flags, regs)
 		# x86_64 SysV ABI: arg0=rdi (vma), arg1=rsi (address)
@@ -345,18 +376,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			# that the call site is the unit of taint granularity, not the byte.
 			enable_taint()
 			backtrace = [hex(a) for a in panda.callstack_callers(20, cpu)]
-			call_label = kdo_label_nr
-			kdo_label_nr += 1
-			label_map[call_label] = {
+			call_label, untranslatable = taint_label_range(cpu, ptr, length, {
 				'virt_addr': hex(ptr),
 				'len': length,
 				'backtrace': backtrace,
-			}
-			for offset in range(length):
-				virt_addr = ptr + offset
-				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
-				panda.taint_label_ram(taint_paddr, call_label)
-			print(f'[analysis1]   tainted {length} bytes with label {call_label}')
+			})
+			used_labels = length - untranslatable
+			print(f'[analysis1]   tainted {length} bytes with label {call_label} ({used_labels}/{length} bytes translated)')
 			return
 
 		if sink_addr is not None and addr == sink_addr:
@@ -432,66 +458,58 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 					'size': size,
 					'tainted_bytes': tainted_bytes,
 				})
+				print(f'[analysis1] __asan_memcpy target hit complete — ending analysis')
+				panda.end_analysis()
 			return
 
 		if kasan_check_write_addr is not None and addr == kasan_check_write_addr:
-			is_target = (immediate_caller == bitmap_ip_add_kasan_retaddr)
 			kasan_check_write_hit_ctr += 1
+			ptr  = panda.arch.get_arg(cpu, 0)
+			size = panda.arch.get_arg(cpu, 1)
+			is_target = (immediate_caller == bitmap_ip_add_kasan_retaddr)
 
 			if is_target:
 				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('bitmap_ip_add_kasan_check_writes', [])) + 1} at kasan_check_write call #{kasan_check_write_hit_ctr} ***")
-				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
-				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
 
-				ptr  = panda.arch.get_arg(cpu, 0)
-				size = panda.arch.get_arg(cpu, 1)
-				log(f'  dst=0x{ptr:x} size={size} (store not yet executed — checking source value slots)')
-
-				# At kasan_check_write entry the store hasn't happened yet, so
-				# ptr (the destination) is untainted by definition.  The value
-				# about to be written lives in bitmap_ip_add's stack frame:
-				#   call site +955 (bytes  counter): value in 0x10(%rsp)
-				#   call site +905 (packets counter): value in 0x08(%rsp)
-				# We check both slots: whichever holds 0xdeadbeefc00ffeee is
-				# the one being written.
+				# Inspect source value slots in bitmap_ip_add's stack frame.
+				# rsp+0x10 holds the value about to be stored out-of-bounds;
+				# taint on it confirms the OOB value traces back to user input.
 				rsp = panda.arch.get_reg(cpu, 'rsp')
-				tainted_src = {}
+				tainted_src_bytes = {}
 				for slot_name, slot_off in [('rsp+0x08', 0x08), ('rsp+0x10', 0x10)]:
 					vaddr = rsp + slot_off
 					try:
 						raw = panda.virtual_memory_read(cpu, vaddr, 8)
 						val = int.from_bytes(raw, 'little')
 					except Exception as e:
-						log(f'  {slot_name}=0x{vaddr:x} unreadable: {e}')
+						print(f'[analysis1]   {slot_name}=0x{vaddr:x} unreadable: {e}')
 						continue
 					paddr = panda.virt_to_phys(cpu, vaddr)
 					if paddr == 0xFFFFFFFFFFFFFFFF:
-						log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} not translatable')
+						print(f'[analysis1]   {slot_name}=0x{vaddr:x} val=0x{val:x} not translatable')
 						continue
 					result = panda.taint_get_ram(paddr)
 					labels = result.get_labels() if result is not None else set()
 					resolved = [label_map[l] for l in labels if l in label_map]
-					log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} labels={labels} resolved={resolved}')
+					print(f'[analysis1]   src {slot_name}=0x{vaddr:x} val=0x{val:x} labels={labels} resolved={resolved}')
 					if labels:
-						tainted_src[slot_name] = {
+						tainted_src_bytes[slot_name] = {
+							'vaddr': hex(vaddr),
 							'val': hex(val),
 							'labels': list(labels),
 							'resolved': resolved,
 						}
-
-				if tainted_src:
-					print(f'[analysis1]   tainted source slots: {tainted_src}')
-				else:
-					print(f'[analysis1]   no taint on source value slots (rsp=0x{rsp:x})')
 
 				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append({
 					'hit': kasan_check_write_hit_ctr,
 					'backtrace': [hex(a) for a in callers],
 					'ptr': hex(ptr),
 					'size': size,
-					'tainted_src': tainted_src,
+					'tainted_src_bytes': tainted_src_bytes,
 				})
-				return
+
+				if tainted_src_bytes:
+					print(f"[analysis1] *** OOB TAINT CONFIRMED via source buffer: {len(tainted_src_bytes)} tainted slot(s) at kasan_check_write hit #{kasan_check_write_hit_ctr} ***")
 
 		return
 
@@ -511,49 +529,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
 		panda.disable_ppp("on_sys_execve_enter")
-
-	@panda.ppp("syscalls2", "on_sys_sendmsg_enter")
-	def on_sys_sendmsg_enter(cpu, pc, fd, msg_ptr, flags):
-		if not pattern.search(panda.get_process_name(cpu)):
-			return
-		if not panda.taint_enabled():
-			return
-		try:
-			# struct msghdr: first two fields are msg_name (ptr, 8B) + msg_namelen (u32, 4B)
-			# then msg_iov (ptr, 8B) at offset 16, msg_iovlen (size_t, 8B) at offset 24
-			# struct iovec: iov_base (ptr, 8B) + iov_len (size_t, 8B)
-			msg_iov_ptr  = panda.virtual_memory_read(cpu, msg_ptr + 16, 8)
-			iov_ptr      = int.from_bytes(msg_iov_ptr, 'little')
-			iov_base_raw = panda.virtual_memory_read(cpu, iov_ptr, 8)
-			iov_len_raw  = panda.virtual_memory_read(cpu, iov_ptr + 8, 8)
-			iov_base = int.from_bytes(iov_base_raw, 'little')
-			iov_len  = int.from_bytes(iov_len_raw,  'little')
-		except Exception as e:
-			print(f'[analysis1] sendmsg: failed to read msghdr/iovec: {e}')
-			return
-
-		# Scan the nlh buffer for tainted bytes and report.
-		tainted = {}
-		for offset in range(min(iov_len, 1024)):
-			labels = get_taint_labels(cpu, iov_base + offset)
-			if labels:
-				resolved = [label_map[l] for l in labels if l in label_map]
-				tainted[offset] = {'labels': list(labels), 'resolved': resolved}
-
-		if tainted:
-			msg = (
-				f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: '
-				f'TAINTED {len(tainted)}/{iov_len} bytes'
-			)
-			print(f'[analysis1] {msg}')
-			log(msg)
-			for off, info in tainted.items():
-				entry = f'  [{off}] @ 0x{iov_base+off:x} labels={info["labels"]} resolved={info["resolved"]}'
-				log(entry)
-		else:
-			msg = f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: no taint on nlh buffer'
-			print(f'[analysis1] {msg}')
-			log(msg)
 
 	@panda.ppp("syscalls2", "on_sys_mmap_enter")
 	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
@@ -601,7 +576,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	print('[analysis1] replay done!')
 
 	end = time.time()
-	total_labels = kdo_label_nr - 1  # labels are 1-based
+	total_labels = label_nr - 1  # labels are 1-based
 	print(f'[analysis1] time: {end - start:.1f}s')
 	print(f'[analysis1] total __asan_memcpy calls in repro: {memcpy_hit_ctr}')
 	print(f'[analysis1] copy_to_urb target hits: {len(analysis.get("copy_to_urb_memcpy_calls", []))}')

@@ -266,7 +266,7 @@ class ProcessMappings:
     # -----------------------------------------------------------------------
     # DBG helpers — set _DBG = False to silence all maple-walk traces at once
     # -----------------------------------------------------------------------
-    _DBG = True
+    _DBG = False
 
     def _dbg(self, msg):
         if self._DBG:
