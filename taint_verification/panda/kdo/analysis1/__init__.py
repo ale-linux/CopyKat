@@ -25,6 +25,10 @@ memcpy_hit_ctr = 0
 kasan_check_write_hit_ctr = 0
 kdo_label_nr = 1
 
+# REMOVEME: debug dump state for kasan_check_write target hits
+_dbg_dump_base = None   # first ptr seen (set on hit #1, never changes)
+_dbg_dump_next = None   # one-past-the-last byte already written (advances each hit)
+
 
 def _load_kernelinfo(path):
 	"""Parse a kernelinfo.conf and return a flat dict of key -> int."""
@@ -155,14 +159,16 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	# each other; in practice kdo replays are single-CPU, but the guard is free.
 	handle_mm_fault_pending = {}
 
-	# Pages that on_ret has classified as heap/anon and queued for taint labelling.
+	# Raw page_base values queued by on_ret for classification and taint labelling.
 	# on_ret fires from PANDA_CB_BEFORE_BLOCK_EXEC — the TB for the current
-	# iteration is *about to execute*, so calling taint_enable() there would set
-	# execute_llvm=1 before the TB is dispatched, crashing on assert(llvm_tc_ptr).
+	# iteration is *about to execute*.  Reading guest virtual memory there
+	# (e.g. for a VMA walk) can hit MMIO-backed page-table entries, which causes
+	# address_space_read_continue() to call RR_DO_RECORD_OR_REPLAY at the wrong
+	# rr_guest_instr_count and diverge the replay log.
 	# on_call fires from PANDA_CB_AFTER_BLOCK_EXEC — the TB has already finished,
-	# so taint_enable() there is safe: tb_flush runs at the very next
-	# panda_callbacks_before_find_fast(), and tb_find then produces an LLVM TB.
-	# Each entry is (page_base, vma_snapshot) so on_call can do the taint work.
+	# so pm.refresh() and taint_enable() are both safe there.
+	# The VMA lookup + heap/anon filter is therefore done in the on_call drain,
+	# not here.
 	zero_page_pending = []
 
 	# Set to True by on_sys_mmap_return when a new mapping was created.
@@ -170,6 +176,79 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	# fully committed the maple-tree rewrite and returned to user space, so the
 	# tree is stable and readable.
 	refresh_pending = False
+
+	# Set to the kasan_check_write destination ptr when we want to catch the
+	# subsequent store.  The virt_mem_after_write callback reads it, prints the
+	# written value, then clears itself and this variable.
+	_pending_write_watch = None
+	_write_watch_cb_registered = False
+
+	def _on_virt_mem_after_write_py(cpu, pc, addr, size, buf):
+		nonlocal _pending_write_watch, _write_watch_cb_registered
+		if _pending_write_watch is None or addr != _pending_write_watch:
+			return
+		raw = bytes(panda.ffi.buffer(buf, size))
+		val = int.from_bytes(raw[:min(size, 8)], 'little')
+		print(f'[analysis1]   after_write: addr=0x{addr:x} size={size} value=0x{val:x}')
+		_pending_write_watch = None
+		panda.disable_callback('_on_virt_mem_after_write')
+		_write_watch_cb_registered = False
+
+	# register_callback expects a CFFI function pointer, not a plain Python
+	# function.  Wrap once and reuse — the ffi.callback object must stay alive
+	# for as long as the callback can fire.
+	# The _t typedef is not exposed through CFFI headers so use the raw sig.
+	_on_virt_mem_after_write_c = panda.ffi.callback(
+		"void(CPUState *, uint64_t, uint64_t, size_t, uint8_t *)",
+		_on_virt_mem_after_write_py,
+	)
+
+	def _arm_write_watch(ptr):
+		nonlocal _pending_write_watch, _write_watch_cb_registered
+		_pending_write_watch = ptr
+		# panda_enable_memcb() just sets panda_use_memcb = true — safe to call
+		# repeatedly, it's idempotent.
+		panda.enable_memcb()
+		if not _write_watch_cb_registered:
+			panda.register_callback(
+				panda.callback.virt_mem_after_write,
+				_on_virt_mem_after_write_c,
+				'_on_virt_mem_after_write',
+			)
+			_write_watch_cb_registered = True
+		else:
+			panda.enable_callback('_on_virt_mem_after_write')
+
+	def removeme_debug_dump(cpu, ptr):
+		"""REMOVEME: dump the region [_dbg_dump_base, ptr) as 8-byte quads.
+
+		On the first call ptr becomes the base; nothing is printed.
+		On every subsequent call the bytes written so far (base..ptr-1,
+		exclusive of the current store which hasn't happened yet) are shown.
+		"""
+		global _dbg_dump_base, _dbg_dump_next
+		if _dbg_dump_base is None:
+			_dbg_dump_base = ptr
+			_dbg_dump_next = ptr
+			return
+		# Print everything from base up to (but not including) the current ptr.
+		# ptr advances by 8 each hit, so the range [_dbg_dump_base, ptr) grows.
+		start = _dbg_dump_base
+		end   = ptr          # exclusive — this store hasn't happened yet
+		if end <= start:
+			_dbg_dump_next = ptr
+			return
+		print(f'[REMOVEME] dump 0x{start:x}..0x{end-1:x} ({(end-start)//8} quad(s)):')
+		addr = start
+		while addr < end:
+			try:
+				raw = panda.virtual_memory_read(cpu, addr, 8)
+				val = int.from_bytes(raw, 'little')
+				print(f'[REMOVEME]   0x{addr:016x}:\t0x{val:016x}')
+			except Exception as e:
+				print(f'[REMOVEME]   0x{addr:016x}:\t<unreadable: {e}>')
+			addr += 8
+		_dbg_dump_next = ptr
 
 	def on_ret(cpu, addr):
 		"""Hook on handle_mm_fault return.
@@ -182,9 +261,16 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		sink.  Any subsequent explicit store via kdo_store_callback will overwrite
 		this background label with a more specific one, which is the desired
 		behaviour.
-		"""
-		global kdo_label_nr
 
+		IMPORTANT: do NOT call pm.refresh() or any guest virtual-memory read here.
+		on_ret fires from PANDA_CB_BEFORE_BLOCK_EXEC.  Reading guest memory at
+		that point can cause address_space_read_continue() to call
+		RR_DO_RECORD_OR_REPLAY(RR_CALLSITE_READ_1) on an MMIO-backed page-table
+		entry, writing an RR_INPUT_4 log entry at the wrong rr_guest_instr_count.
+		During replay rr_prog_point_compare() then sees current > recorded and
+		aborts with "Ahead of log / FOUND DISAGREEMENT".
+		VMA classification is deferred to the on_call drain (AFTER_BLOCK_EXEC).
+		"""
 		if handle_mm_fault_addr is None or addr != handle_mm_fault_addr:
 			return
 
@@ -198,34 +284,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			return
 
 		page_base = fault_addr & ~(PAGE_SIZE - 1)
-		print(f'[analysis1] on_ret(handle_mm_fault): cpu{cpu_idx} fault_addr=0x{fault_addr:x} page_base=0x{page_base:x}')
+		print(f'[analysis1] on_ret(handle_mm_fault): cpu{cpu_idx} fault_addr=0x{fault_addr:x} page_base=0x{page_base:x} — queued for classification')
 
-		# Classify the faulted page using the cached VMA list.
-		# We only taint on-demand anonymous pages (heap / brk / plain anon).
-		# Stack and file-backed pages are excluded.
-		# Force a fresh walk of the maple tree so that a VMA created by this
-		# very fault (e.g. first access to a new anonymous mapping) is visible.
-		pm.refresh(cpu)
-		containing_vma = None
-		for mapping in pm.mappings:
-			if mapping['base'] <= page_base < mapping['base'] + mapping['size']:
-				containing_vma = mapping
-				break
-
-		if containing_vma is None:
-			print(f'[analysis1] on_ret(handle_mm_fault): page 0x{page_base:x} not found in cached mappings ({len(pm.mappings)} entries) — skipping')
-			return
-		if containing_vma['name'] not in ('[heap]', '[anon]'):
-			print(f'[analysis1] on_ret(handle_mm_fault): page 0x{page_base:x} in vma {containing_vma["name"]!r} — not heap/anon, skipping')
-			return
-
-		# Queue for taint labelling — do NOT call enable_taint() here.
-		# on_ret fires from BEFORE_BLOCK_EXEC; the TB is still about to run.
-		# enable_taint() sets execute_llvm=1 immediately, which would cause
-		# assert(llvm_tc_ptr) on the same TB before tb_flush can clear the cache.
-		# The work is drained by on_call which fires from AFTER_BLOCK_EXEC.
-		zero_page_pending.append((page_base, dict(containing_vma)))
-		print(f'[analysis1] on_ret(handle_mm_fault): queued page 0x{page_base:x} (vma {containing_vma["name"]}) for taint labelling')
+		# Queue raw page_base only.  VMA lookup + heap/anon filter happen in
+		# the on_call drain where guest memory reads are safe (AFTER_BLOCK_EXEC).
+		zero_page_pending.append(page_base)
 
 	def on_call(cpu, addr):
 		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
@@ -245,13 +308,34 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			pm.refresh(cpu)
 
 		# Drain any pages queued by on_ret.  on_call fires from AFTER_BLOCK_EXEC
-		# so the current TB has already executed — safe to call enable_taint() and
-		# issue taint_label_ram() calls here.
+		# so the current TB has already executed — safe to call pm.refresh(),
+		# enable_taint(), and issue taint_label_ram() calls here.
+		if zero_page_pending:
+			# One refresh covers all queued pages: they were all faulted in the
+			# same BEFORE_BLOCK_EXEC→AFTER_BLOCK_EXEC window so the VMA list
+			# hasn't changed between them.
+			pm.refresh(cpu)
+
 		while zero_page_pending:
-			page_base, vma = zero_page_pending.pop(0)
+			page_base = zero_page_pending.pop(0)
+
+			# Classify the faulted page using the freshly refreshed VMA list.
+			containing_vma = None
+			for mapping in pm.mappings:
+				if mapping['base'] <= page_base < mapping['base'] + mapping['size']:
+					containing_vma = mapping
+					break
+
+			if containing_vma is None:
+				print(f'[analysis1] on_call drain: page 0x{page_base:x} not found in mappings ({len(pm.mappings)} entries) — skipping')
+				continue
+			if containing_vma['name'] not in ('[heap]', '[anon]'):
+				print(f'[analysis1] on_call drain: page 0x{page_base:x} in vma {containing_vma["name"]!r} — not heap/anon, skipping')
+				continue
+
 			enable_taint()
 			first_label = kdo_label_nr
-			print(f'[analysis1] on_call drain: zero-page labels starting at {first_label} for page 0x{page_base:x} (vma {vma["name"]} 0x{vma["base"]:x}+{vma["size"]})')
+			print(f'[analysis1] on_call drain: zero-page labels starting at {first_label} for page 0x{page_base:x} (vma {containing_vma["name"]} 0x{containing_vma["base"]:x}+{containing_vma["size"]})')
 			untranslatable = 0
 			for offset in range(PAGE_SIZE):
 				virt_addr   = page_base + offset
@@ -441,48 +525,53 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 			if is_target:
 				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('bitmap_ip_add_kasan_check_writes', [])) + 1} at kasan_check_write call #{kasan_check_write_hit_ctr} ***")
 				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
+	
+				ptr  = panda.arch.get_arg(cpu, 0)
+				removeme_debug_dump(cpu, ptr)
+				_arm_write_watch(ptr)
 				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
 
-				ptr  = panda.arch.get_arg(cpu, 0)
 				size = panda.arch.get_arg(cpu, 1)
-				log(f'  dst=0x{ptr:x} size={size} (store not yet executed — checking source value slots)')
-
-				# At kasan_check_write entry the store hasn't happened yet, so
-				# ptr (the destination) is untainted by definition.  The value
-				# about to be written lives in bitmap_ip_add's stack frame:
-				#   call site +955 (bytes  counter): value in 0x10(%rsp)
-				#   call site +905 (packets counter): value in 0x08(%rsp)
-				# We check both slots: whichever holds 0xdeadbeefc00ffeee is
-				# the one being written.
+				# Call site is bitmap_ip_add+0x3bb (retaddr +0x3c0).  Disassembly:
+				#   +970  mov 0x18(%rsp),%rax   ← destination address (== ptr / arg0)
+				#   +975  mov 0x10(%rsp),%rdx   ← value to be written
+				#   +980  mov %rdx,(%rax)       ← the actual store
+				# So rsp+0x10 holds the value; rsp+0x18 is the destination (already
+				# captured in ptr above).  rsp+0x08 is unrelated to this call site.
 				rsp = panda.arch.get_reg(cpu, 'rsp')
+				value_slot = rsp + 0x10
+				read_len = min(size, 8) if size > 0 else 8
+				log(f'  write target=0x{ptr:x} size={size} value_slot=rsp+0x10=0x{value_slot:x} (store not yet executed)')
 				tainted_src = {}
-				for slot_name, slot_off in [('rsp+0x08', 0x08), ('rsp+0x10', 0x10)]:
-					vaddr = rsp + slot_off
-					try:
-						raw = panda.virtual_memory_read(cpu, vaddr, 8)
-						val = int.from_bytes(raw, 'little')
-					except Exception as e:
-						log(f'  {slot_name}=0x{vaddr:x} unreadable: {e}')
-						continue
-					paddr = panda.virt_to_phys(cpu, vaddr)
-					if paddr == 0xFFFFFFFFFFFFFFFF:
-						log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} not translatable')
-						continue
-					result = panda.taint_get_ram(paddr)
-					labels = result.get_labels() if result is not None else set()
-					resolved = [label_map[l] for l in labels if l in label_map]
-					log(f'  {slot_name}=0x{vaddr:x} val=0x{val:x} labels={labels} resolved={resolved}')
-					if labels:
-						tainted_src[slot_name] = {
+				try:
+					raw = panda.virtual_memory_read(cpu, value_slot, read_len)
+					val = int.from_bytes(raw, 'little')
+				except Exception as e:
+					log(f'  rsp+0x10=0x{value_slot:x} unreadable: {e}')
+					val = None
+				if val is not None:
+					slot_labels = set()
+					for byte_off in range(read_len):
+						baddr = panda.virt_to_phys(cpu, value_slot + byte_off)
+						if baddr == 0xFFFFFFFFFFFFFFFF:
+							continue
+						result = panda.taint_get_ram(baddr)
+						if result is not None:
+							slot_labels.update(result.get_labels())
+					resolved = [label_map[l] for l in slot_labels if l in label_map]
+					log(f'  rsp+0x10=0x{value_slot:x} val=0x{val:x} labels={slot_labels} resolved={resolved}')
+					print(f'[analysis1]   write target=0x{ptr:x}  value=0x{val:x}  taint_labels={slot_labels}  resolved={resolved}')
+					if slot_labels:
+						tainted_src['rsp+0x10'] = {
 							'val': hex(val),
-							'labels': list(labels),
+							'labels': list(slot_labels),
 							'resolved': resolved,
 						}
-
-				if tainted_src:
-					print(f'[analysis1]   tainted source slots: {tainted_src}')
 				else:
-					print(f'[analysis1]   no taint on source value slots (rsp=0x{rsp:x})')
+					print(f'[analysis1]   write target=0x{ptr:x}  value=<unreadable> (rsp=0x{rsp:x})')
+	
+				if not tainted_src:
+					print(f'[analysis1]   no taint on write value (rsp+0x10=0x{value_slot:x})')
 
 				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append({
 					'hit': kasan_check_write_hit_ctr,
@@ -511,49 +600,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
 		panda.disable_ppp("on_sys_execve_enter")
-
-	@panda.ppp("syscalls2", "on_sys_sendmsg_enter")
-	def on_sys_sendmsg_enter(cpu, pc, fd, msg_ptr, flags):
-		if not pattern.search(panda.get_process_name(cpu)):
-			return
-		if not panda.taint_enabled():
-			return
-		try:
-			# struct msghdr: first two fields are msg_name (ptr, 8B) + msg_namelen (u32, 4B)
-			# then msg_iov (ptr, 8B) at offset 16, msg_iovlen (size_t, 8B) at offset 24
-			# struct iovec: iov_base (ptr, 8B) + iov_len (size_t, 8B)
-			msg_iov_ptr  = panda.virtual_memory_read(cpu, msg_ptr + 16, 8)
-			iov_ptr      = int.from_bytes(msg_iov_ptr, 'little')
-			iov_base_raw = panda.virtual_memory_read(cpu, iov_ptr, 8)
-			iov_len_raw  = panda.virtual_memory_read(cpu, iov_ptr + 8, 8)
-			iov_base = int.from_bytes(iov_base_raw, 'little')
-			iov_len  = int.from_bytes(iov_len_raw,  'little')
-		except Exception as e:
-			print(f'[analysis1] sendmsg: failed to read msghdr/iovec: {e}')
-			return
-
-		# Scan the nlh buffer for tainted bytes and report.
-		tainted = {}
-		for offset in range(min(iov_len, 1024)):
-			labels = get_taint_labels(cpu, iov_base + offset)
-			if labels:
-				resolved = [label_map[l] for l in labels if l in label_map]
-				tainted[offset] = {'labels': list(labels), 'resolved': resolved}
-
-		if tainted:
-			msg = (
-				f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: '
-				f'TAINTED {len(tainted)}/{iov_len} bytes'
-			)
-			print(f'[analysis1] {msg}')
-			log(msg)
-			for off, info in tainted.items():
-				entry = f'  [{off}] @ 0x{iov_base+off:x} labels={info["labels"]} resolved={info["resolved"]}'
-				log(entry)
-		else:
-			msg = f'sendmsg fd={fd} nlh=0x{iov_base:x} len={iov_len}: no taint on nlh buffer'
-			print(f'[analysis1] {msg}')
-			log(msg)
 
 	@panda.ppp("syscalls2", "on_sys_mmap_enter")
 	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
