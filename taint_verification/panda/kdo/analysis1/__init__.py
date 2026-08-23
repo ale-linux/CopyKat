@@ -13,6 +13,7 @@ import time
 import json
 import traceback
 import re
+import bisect
 import faulthandler
 import tempfile
 
@@ -48,7 +49,7 @@ def _load_kernelinfo(path):
 	return ki
 
 
-def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, enable_logging):
+def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, enable_logging):
 	crashlogf = open(
 		tempfile.NamedTemporaryFile(
 			prefix="crash_info_", suffix=".log", dir=None, delete=False
@@ -177,47 +178,319 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	# tree is stable and readable.
 	refresh_pending = False
 
-	# Set to the kasan_check_write destination ptr when we want to catch the
-	# subsequent store.  The virt_mem_after_write callback reads it, prints the
-	# written value, then clears itself and this variable.
-	_pending_write_watch = None
-	_write_watch_cb_registered = False
+	# ------------------------------------------------------------------
+	# OOB destination taint probe
+	#
+	# Goal: read the taint labels on the bytes that the kernel writes out of
+	# bounds, using the __kasan_check_write call as the signal.
+	#
+	# Why this is not a one-liner: __kasan_check_write fires BEFORE the store,
+	# and the obvious place to look afterwards — cb_virt_mem_after_write — is
+	# the one place where the answer is guaranteed to be wrong.  That callback
+	# fires from inside the store helper (softmmu_template.h:470, in
+	# helper_le_stq_mmu_panda), but taint2's shadow-memory update for the very
+	# same store is emitted as SEPARATE instructions AFTER the helper call
+	# returns (PandaTaintVisitor::insertTaintBulk — insertLogPop() puts the
+	# memlog pops after the store's CallInst, then taint_copy goes after those).
+	# So inside the write callback the shadow still holds the PRE-store state:
+	# correct value, zero taint.
+	#
+	# The earliest safe read point is after_insn_exec, whose helper is emitted
+	# right after disas_insn() finishes the instruction
+	# (target/i386/translate.c:8552-8557), giving this order within a single
+	# instruction:
+	#
+	#   call helper_le_stq_mmu_panda(...)  -> the store; write watcher fires
+	#   call taint_memlog_pop / taint_copy -> taint2 updates shadow memory
+	#   call helper_panda_after_insn_exec  -> our probe: taint is now visible
+	#                                         and no later insn has executed
+	#
+	# Cost is the constraint that shapes the rest.  The kernel runs with
+	# kasan.fault=report, so the full KASAN report (unwind + symbolisation +
+	# printk) executes inside __kasan_check_write and again inside
+	# __asan_store8, BEFORE the store.  A probe on every instruction would be
+	# unusable.  after_insn_translate is a TRANSLATE-time gate, so restricting
+	# it to the storing function's own pc range means the report path (which
+	# lives in other functions) never gets a probe emitted at all and costs
+	# nothing at execution time.  The write watcher cannot be pc-gated, so it is
+	# armed late instead: the first probe firing proves control is back inside
+	# the function with the report behind us.  on_call turns it back off for the
+	# duration of any callee — notably __asan_store8 and its own report.
+	#
+	# Division of labour:
+	#   __kasan_check_write  -> dst/size, and the pc range to instrument
+	#   virt_mem_after_write -> dst-keyed: "a write landed, at pc X".  No taint.
+	#   after_insn_exec      -> reads the taint, one instruction after the store
+	# ------------------------------------------------------------------
+	_oob = {
+		'armed': False,
+		'dst': None,          # destination ptr flagged by __kasan_check_write
+		'size': 0,
+		'paddrs': [],         # dst byte offset -> paddr, resolved at arm time
+		'func_addr': None,    # entry pc of the function performing the store
+		'lo': 0, 'hi': 0,     # gate pc range
+		'watcher_on': False,
+		'store_seen': False,  # a write overlapping dst has landed
+		'store_pc': None,
+		'store_val': None,
+		'taint_read': False,  # the probe actually got to read the shadow
+		'probe_fired': 0,
+		'hit': None,
+		'entry': None,        # analysis dict to fill in when we finish
+	}
 
-	def _on_virt_mem_after_write_py(cpu, pc, addr, size, buf):
-		nonlocal _pending_write_watch, _write_watch_cb_registered
-		if _pending_write_watch is None or addr != _pending_write_watch:
+	# rrr runs plain `nm` (no -S), so Func carries no size.  func_map is keyed by
+	# address, so the next symbol above a function's entry is the best available
+	# upper bound for its extent.
+	_sym_addrs = sorted(func_map.keys())
+
+	def _function_extent(func_addr, ret_pc, fallback=50):
+		"""(lo, hi) pc range to instrument: from `ret_pc` (where control resumes
+		after the KASAN check) to the end of the function at `func_addr`.
+
+		nm also reports data symbols, so an implausibly large extent is clamped
+		back to the ret_pc + fallback window.  Over-wide is harmless — the range
+		only has to contain the store and exclude other functions."""
+		i = bisect.bisect_right(_sym_addrs, func_addr)
+		hi = _sym_addrs[i] if i < len(_sym_addrs) else None
+		if hi is None or hi - func_addr > 0x2000:
+			hi = ret_pc + fallback
+		# Never return less than the fallback window: a stray intra-function
+		# symbol would otherwise put the store outside the gated range, which
+		# degrades to a 'store_not_read' verdict instead of an answer.
+		return ret_pc, max(hi, ret_pc + fallback)
+
+	@panda.cb_virt_mem_after_write(name='oob_write_watcher', enabled=False)
+	def oob_write_watcher(cpu, pc, addr, size, buf):
+		"""The dst-keyed detector for the OOB store.
+
+		Its ONLY job is to record that a write landed in [dst, dst+size) and at
+		which pc.  It deliberately does NOT read taint — see the block comment
+		above: at this point taint_copy for this very store has not run yet, so
+		the shadow would report the pre-store state.  It also reads no guest
+		memory; the written value comes from `buf`."""
+		dst = _oob['dst']
+		if dst is None or not _oob['armed']:
 			return
-		raw = bytes(panda.ffi.buffer(buf, size))
-		val = int.from_bytes(raw[:min(size, 8)], 'little')
-		print(f'[analysis1]   after_write: addr=0x{addr:x} size={size} value=0x{val:x}')
-		_pending_write_watch = None
-		panda.disable_callback('_on_virt_mem_after_write')
-		_write_watch_cb_registered = False
-
-	# register_callback expects a CFFI function pointer, not a plain Python
-	# function.  Wrap once and reuse — the ffi.callback object must stay alive
-	# for as long as the callback can fire.
-	# The _t typedef is not exposed through CFFI headers so use the raw sig.
-	_on_virt_mem_after_write_c = panda.ffi.callback(
-		"void(CPUState *, uint64_t, uint64_t, size_t, uint8_t *)",
-		_on_virt_mem_after_write_py,
-	)
-
-	def _arm_write_watch(ptr):
-		nonlocal _pending_write_watch, _write_watch_cb_registered
-		_pending_write_watch = ptr
-		# panda_enable_memcb() just sets panda_use_memcb = true — safe to call
-		# repeatedly, it's idempotent.
-		panda.enable_memcb()
-		if not _write_watch_cb_registered:
-			panda.register_callback(
-				panda.callback.virt_mem_after_write,
-				_on_virt_mem_after_write_c,
-				'_on_virt_mem_after_write',
-			)
-			_write_watch_cb_registered = True
+		if addr + size <= dst or addr >= dst + _oob['size']:
+			return
+		# PANDA hands us (uint8_t *)&val where val is a uint64_t, so never read
+		# more than 8 bytes out of it regardless of the access width.
+		val = int.from_bytes(bytes(panda.ffi.buffer(buf, min(size, 8))), 'little')
+		if not _oob['store_seen']:
+			_oob['store_seen'] = True
+			_oob['store_pc']   = pc
+			_oob['store_val']  = val
+			print(f'[analysis1]   oob watcher: store landed pc=0x{pc:x} addr=0x{addr:x} '
+				  f'size={size} value=0x{val:x} (taint read deferred to probe)')
 		else:
-			panda.enable_callback('_on_virt_mem_after_write')
+			print(f'[analysis1]   oob watcher: EXTRA write to dst pc=0x{pc:x} '
+				  f'addr=0x{addr:x} size={size} value=0x{val:x}')
+
+	def _set_oob_watcher(on):
+		"""Enable/disable the write watcher.
+
+		Legal to call from inside the probe: it is just plist->enabled on a
+		different callback list than the one being iterated, and in LLVM mode
+		(which taint2 forces) tcg-llvm always emits the _panda store helpers,
+		which dispatch mem callbacks unconditionally — so it takes effect on the
+		very next memory access with no retranslation."""
+		if on == _oob['watcher_on']:
+			return
+		if on:
+			# No-op on the LLVM path (panda_use_memcb is only consulted by the
+			# TCG host backend) but needed if this ever runs without taint2.
+			panda.enable_memcb()
+			panda.enable_callback('oob_write_watcher')
+		else:
+			panda.disable_callback('oob_write_watcher')
+		_oob['watcher_on'] = on
+
+	@panda.cb_after_insn_translate(name='oob_probe_gate', enabled=False)
+	def oob_probe_gate(cpu, pc):
+		"""Translate-time gate.  Emitting the probe only for instructions inside
+		the storing function is what keeps the KASAN reporting path free of
+		instrumentation: those pcs live in other functions, answer False here,
+		and therefore cost nothing however many times they execute."""
+		return _oob['armed'] and _oob['lo'] <= pc < _oob['hi']
+
+	@panda.cb_after_insn_exec(name='oob_probe', enabled=False)
+	def oob_probe(cpu, pc):
+		"""Fires after each instruction in the gated range.
+
+		NB `pc` is the NEXT instruction's address — translate.c reassigns pc_ptr
+		via disas_insn() before emitting the helper — so the instruction that
+		just completed is at the previous pc."""
+		if not _oob['armed']:
+			return 0
+		_oob['probe_fired'] += 1
+		# First firing means control is back inside the flagged function, so the
+		# KASAN report is behind us: now it is cheap to watch writes.
+		if not _oob['watcher_on']:
+			_set_oob_watcher(True)
+		if _oob['store_seen'] and not _oob['taint_read']:
+			_read_oob_taint(cpu, pc)
+		return 0
+
+	def _read_oob_taint(cpu, probe_pc):
+		"""Read taint on the OOB destination.
+
+		Touches shadow memory only: the physical addresses were resolved at arm
+		time (from AFTER_BLOCK_EXEC, where guest page-table reads are safe) and
+		the written value came from the watcher's buffer.  Nothing here reads
+		guest memory from inside translated code — see the RR divergence warning
+		on on_ret."""
+		size      = _oob['size']
+		dst       = _oob['dst']
+		store_pc  = _oob['store_pc']
+
+		# probe_pc is the pc AFTER the completed instruction, so this difference
+		# is the store instruction's length.  If it is not a plausible length we
+		# are not on the store's own instruction: translate.c suppresses the
+		# helper for block-terminating instructions (&& !dc->is_jmp), meaning the
+		# probe is firing a block late and another write could have intervened.
+		delta    = probe_pc - store_pc if store_pc is not None else None
+		adjacent = delta is not None and 0 < delta <= 15
+		if not adjacent:
+			print(f'[analysis1]   WARNING: probe pc=0x{probe_pc:x} is not adjacent to '
+				  f'store pc=0x{store_pc:x} (delta={delta}) — the store may have ended its '
+				  f'block and a later write could have clobbered dst; a negative result '
+				  f'here is unproven')
+
+		tainted_bytes  = {}
+		untranslatable = 0
+		if panda.taint_enabled():
+			for off in range(size):
+				paddr = _oob['paddrs'][off] if off < len(_oob['paddrs']) else None
+				if paddr is None:
+					untranslatable += 1
+					continue
+				result = panda.taint_get_ram(paddr)
+				labels = result.get_labels() if result is not None else None
+				if labels:
+					resolved = [label_map[l] for l in labels if l in label_map]
+					tainted_bytes[off] = {'labels': list(labels), 'resolved': resolved}
+					log(f'  oob dst[{off}] @ 0x{dst + off:x} (pa 0x{paddr:x}) '
+						f'labels={labels} resolved={resolved}')
+		else:
+			print('[analysis1]   WARNING: taint not enabled at probe time — cannot read taint')
+
+		_oob['taint_read'] = True
+		_finish_oob('store observed by watcher', tainted_bytes, untranslatable,
+					probe_pc, adjacent)
+
+	def _finish_oob(reason, tainted_bytes=None, untranslatable=0,
+					probe_pc=None, adjacent=None):
+		"""Record the outcome and disarm.
+
+		Four distinguishable outcomes — the point of the whole exercise is that
+		"the store never executed" is never reported as "no taint":
+		  tainted              store landed, dst carries labels
+		  untainted            store landed, no labels — a real negative
+		  store_not_read       store landed but the probe never got to look
+		  store_never_executed no write to dst was ever observed
+		Only reads shadow state and flips callback flags, so it is safe to call
+		from on_ret (BEFORE_BLOCK_EXEC) as well as from the probe."""
+		if not _oob['armed']:
+			return
+		dst, size, hit = _oob['dst'], _oob['size'], _oob['hit']
+		store_pc, store_val = _oob['store_pc'], _oob['store_val']
+
+		if not _oob['store_seen']:
+			outcome = 'store_never_executed'
+			print(f'[analysis1] *** OOB PROBE INCONCLUSIVE (hit #{hit}): {reason} — no write '
+				  f'to 0x{dst:x} was ever observed, so this is NOT a taint negative '
+				  f'(probe fired {_oob["probe_fired"]}x) ***')
+		elif not _oob['taint_read']:
+			outcome = 'store_not_read'
+			print(f'[analysis1] *** OOB PROBE INCONCLUSIVE (hit #{hit}): {reason} — store '
+				  f'landed at pc=0x{store_pc:x} but the probe never read the shadow '
+				  f'(probe fired {_oob["probe_fired"]}x) ***')
+		elif tainted_bytes:
+			outcome = 'tainted'
+			print(f'[analysis1] *** OOB TAINT CONFIRMED (hit #{hit}): '
+				  f'{len(tainted_bytes)}/{size} dst bytes tainted at 0x{dst:x}, '
+				  f'store pc=0x{store_pc:x} value=0x{store_val:x} ***')
+			for off, info in sorted(tainted_bytes.items()):
+				print(f'[analysis1]     dst[{off}] labels={info["labels"]} '
+					  f'resolved={info["resolved"]}')
+		else:
+			outcome = 'untainted'
+			print(f'[analysis1] *** OOB WRITE NOT TAINTED (hit #{hit}): store pc=0x{store_pc:x} '
+				  f'value=0x{store_val:x} landed at 0x{dst:x} but none of the {size} bytes '
+				  f'carry taint ***')
+
+		if untranslatable:
+			print(f'[analysis1]   note: {untranslatable}/{size} dst bytes were not '
+				  f'translatable at arm time')
+
+		if _oob['entry'] is not None:
+			_oob['entry']['oob_dst'] = {
+				'outcome': outcome,
+				'reason': reason,
+				'store_pc': hex(store_pc) if store_pc is not None else None,
+				'store_val': hex(store_val) if store_val is not None else None,
+				'probe_pc': hex(probe_pc) if probe_pc is not None else None,
+				'probe_adjacent': adjacent,
+				'probe_firings': _oob['probe_fired'],
+				'gate_range': [hex(_oob['lo']), hex(_oob['hi'])],
+				'untranslatable_bytes': untranslatable,
+				'tainted_bytes': tainted_bytes or {},
+			}
+		log(f'oob probe: dst=0x{dst:x} size={size} outcome={outcome} reason={reason}')
+
+		_set_oob_watcher(False)
+		panda.disable_callback('oob_probe')
+		panda.disable_callback('oob_probe_gate')
+		_oob.update({'armed': False, 'dst': None, 'entry': None})
+
+	def _arm_oob_probe(cpu, dst, size, ret_pc, func_addr, hit, entry):
+		"""Arm the destination-side probe for a flagged OOB write.
+
+		Must be called from AFTER_BLOCK_EXEC (i.e. from on_call): the dst->paddr
+		walk reads guest page tables, and flush_tb() needs a block boundary to be
+		honoured at."""
+		if size <= 0 or size > 64:
+			print(f'[analysis1]   oob probe: implausible size={size} from '
+				  f'__kasan_check_write, falling back to 8')
+			size = 8
+
+		# Resolve dst -> physical addresses HERE, not in the probe.  Doing the
+		# page-table walk from inside translated code risks the
+		# RR_DO_RECORD_OR_REPLAY divergence documented on on_ret below.
+		paddrs = []
+		for off in range(size):
+			p = panda.virt_to_phys(cpu, dst + off)
+			paddrs.append(None if p == 0xFFFFFFFFFFFFFFFF else p)
+
+		lo, hi = _function_extent(func_addr, ret_pc)
+		_oob.update({
+			'armed': True,
+			'dst': dst,
+			'size': size,
+			'paddrs': paddrs,
+			'func_addr': func_addr,
+			'lo': lo, 'hi': hi,
+			'store_seen': False,
+			'store_pc': None,
+			'store_val': None,
+			'taint_read': False,
+			'probe_fired': 0,
+			'hit': hit,
+			'entry': entry,
+		})
+
+		panda.enable_callback('oob_probe_gate')
+		panda.enable_callback('oob_probe')
+		# The gate is consulted at TRANSLATE time, and panda_enable_callback does
+		# not flush the TB cache — without this, blocks already translated carry
+		# no probe and it would simply never fire.  The flush is honoured at the
+		# next panda_callbacks_before_find_fast(); the `call __kasan_check_write`
+		# we are sitting on (and the `call __asan_store8` after it) both end
+		# blocks, so it lands well before the storing block is looked up.
+		panda.flush_tb()
+		print(f'[analysis1]   oob probe armed: dst=0x{dst:x} size={size} '
+			  f'gate=[0x{lo:x},0x{hi:x}) (watcher stays off until the report is done)')
 
 	def removeme_debug_dump(cpu, ptr):
 		"""REMOVEME: dump the region [_dbg_dump_base, ptr) as 8-byte quads.
@@ -271,6 +544,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		aborts with "Ahead of log / FOUND DISAGREEMENT".
 		VMA classification is deferred to the on_call drain (AFTER_BLOCK_EXEC).
 		"""
+		# OOB probe terminal condition: the flagged function has returned.  If no
+		# write to dst was ever observed then the store did not execute — a
+		# distinct outcome from "the store executed and carried no taint".
+		# Safe here despite the warning above: _finish_oob only reads shadow
+		# state and flips callback flags, it touches no guest memory.
+		if _oob['armed'] and addr == _oob['func_addr']:
+			_finish_oob('flagged function returned')
+
 		if handle_mm_fault_addr is None or addr != handle_mm_fault_addr:
 			return
 
@@ -298,6 +579,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 		pname = panda.get_process_name(cpu)
 		if not pattern.search(pname):
 			return
+
+		# OOB probe: any call out of the flagged function leaves the region we
+		# care about — notably __asan_store8, which runs its own KASAN report.
+		# Turn the write watcher off for the duration; the next probe firing back
+		# inside the function turns it on again.  Without this the second report
+		# runs with a Python callback on every guest write.
+		if _oob['watcher_on']:
+			_set_oob_watcher(False)
 
 		# Drain a deferred pm.refresh() requested by on_sys_mmap_return.
 		# on_call fires from AFTER_BLOCK_EXEC — the first user-space TB after the
@@ -527,11 +816,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
 	
 				ptr  = panda.arch.get_arg(cpu, 0)
+				size = panda.arch.get_arg(cpu, 1)
 				removeme_debug_dump(cpu, ptr)
-				_arm_write_watch(ptr)
 				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
 
-				size = panda.arch.get_arg(cpu, 1)
 				# Call site is bitmap_ip_add+0x3bb (retaddr +0x3c0).  Disassembly:
 				#   +970  mov 0x18(%rsp),%rax   ← destination address (== ptr / arg0)
 				#   +975  mov 0x10(%rsp),%rdx   ← value to be written
@@ -573,13 +861,26 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 				if not tainted_src:
 					print(f'[analysis1]   no taint on write value (rsp+0x10=0x{value_slot:x})')
 
-				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append({
+				entry = {
 					'hit': kasan_check_write_hit_ctr,
 					'backtrace': [hex(a) for a in callers],
 					'ptr': hex(ptr),
 					'size': size,
 					'tainted_src': tainted_src,
-				})
+				}
+				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append(entry)
+
+				# Source-side taint (above) only shows the value heading for the
+				# store.  Arm the destination-side probe to confirm the taint on
+				# the bytes actually written out of bounds.  immediate_caller is
+				# the return address, i.e. where control resumes inside
+				# bitmap_ip_add once the KASAN report is done.
+				if _oob['armed']:
+					print(f'[analysis1]   oob probe still armed from hit #{_oob["hit"]} — '
+						  f'closing it out before re-arming')
+					_finish_oob('superseded by a later kasan_check_write target hit')
+				_arm_oob_probe(cpu, ptr, size, immediate_caller, bitmap_ip_add_addr,
+							   kasan_check_write_hit_ctr, entry)
 				return
 
 		return
@@ -653,6 +954,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, _func_map, symbol_map, 
 	print(f'[analysis1] copy_to_urb target hits: {len(analysis.get("copy_to_urb_memcpy_calls", []))}')
 	print(f'[analysis1] total __kasan_check_write calls in repro: {kasan_check_write_hit_ctr}')
 	print(f'[analysis1] bitmap_ip_add target hits: {len(analysis.get("bitmap_ip_add_kasan_check_writes", []))}')
+	_oob_outcomes = [e.get('oob_dst', {}).get('outcome', 'probe-never-finished')
+					 for e in analysis.get('bitmap_ip_add_kasan_check_writes', [])]
+	print(f'[analysis1] OOB destination probe outcomes per hit: {_oob_outcomes}')
 	print(f'[analysis1] cached process mappings: {len(pm.mappings)}')
 	print(f'[analysis1] total taint labels created: {total_labels}')
 
