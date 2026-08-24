@@ -679,38 +679,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print(f'[analysis1] OOB destination probe set up: gate=[0x{lo:x},0x{hi:x}) '
 			  f'({hi - lo} bytes of bitmap_ip_add), flushed TB cache; '
 			  f'probe armed per hit')
-
-	def removeme_debug_dump(cpu, ptr):
-		"""REMOVEME: dump the region [_dbg_dump_base, ptr) as 8-byte quads.
-
-		On the first call ptr becomes the base; nothing is printed.
-		On every subsequent call the bytes written so far (base..ptr-1,
-		exclusive of the current store which hasn't happened yet) are shown.
-		"""
-		global _dbg_dump_base, _dbg_dump_next
-		if _dbg_dump_base is None:
-			_dbg_dump_base = ptr
-			_dbg_dump_next = ptr
-			return
-		# Print everything from base up to (but not including) the current ptr.
-		# ptr advances by 8 each hit, so the range [_dbg_dump_base, ptr) grows.
-		start = _dbg_dump_base
-		end   = ptr          # exclusive — this store hasn't happened yet
-		if end <= start:
-			_dbg_dump_next = ptr
-			return
-		print(f'[REMOVEME] dump 0x{start:x}..0x{end-1:x} ({(end-start)//8} quad(s)):')
-		addr = start
-		while addr < end:
-			try:
-				raw = panda.virtual_memory_read(cpu, addr, 8)
-				val = int.from_bytes(raw, 'little')
-				print(f'[REMOVEME]   0x{addr:016x}:\t0x{val:016x}')
-			except Exception as e:
-				print(f'[REMOVEME]   0x{addr:016x}:\t<unreadable: {e}>')
-			addr += 8
-		_dbg_dump_next = ptr
-
+			  
 	# Call targets on_call actually does something for.  Testing membership here is
 	# a set lookup with no guest reads, which is what lets the OSI-based process
 	# check in _in_repro() stay correct without running on every call instruction.
@@ -1047,7 +1016,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	
 				ptr  = panda.arch.get_arg(cpu, 0)
 				size = panda.arch.get_arg(cpu, 1)
-				removeme_debug_dump(cpu, ptr)
+
 				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
 
 				# Call site is bitmap_ip_add+0x3bb (retaddr +0x3c0).  Disassembly:
