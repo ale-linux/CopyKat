@@ -20,6 +20,38 @@ import tempfile
 pattern = re.compile(r"\brepro$")
 
 from .mappings import ProcessMappings
+from cffi import FFI
+
+# pandare's panda.get_process_name() LEAKS.  osi's get_current_process() mallocs
+# an OsiProc plus a separate name string and pages list (osi_types.h:72-81), and
+# pandare only reads proc.name and drops the pointer — nothing is ever freed.  In
+# a hot path that leaks steadily for the whole replay.  Free all three ourselves,
+# the same way kdo/analysis2/__init__.py:is_repro() does, and never call
+# panda.get_process_name() from this module.
+_free_ffi = FFI()
+_free_ffi.cdef("void free(void *);")
+# dlopen(None) is the process's own symbol namespace, which already includes libc
+# since libpanda links against it — no need for a hardcoded multiarch path.
+_libc = _free_ffi.dlopen(None)
+
+
+def process_name(panda, cpu):
+	"""Current process name, or None — without leaking the OsiProc.
+
+	Replacement for panda.get_process_name(); see the comment above."""
+	proc = panda.plugins['osi'].get_current_process(cpu)
+	if proc == panda.ffi.NULL:
+		return None
+	try:
+		if proc.name == panda.ffi.NULL:
+			return None
+		return panda.ffi.string(proc.name).decode('utf-8', 'ignore')
+	finally:
+		if proc.name != panda.ffi.NULL:
+			_libc.free(proc.name)
+		if proc.pages != panda.ffi.NULL:
+			_libc.free(proc.pages)
+		_libc.free(proc)
 
 analysis = dict()
 memcpy_hit_ctr = 0
@@ -49,7 +81,15 @@ def _load_kernelinfo(path):
 	return ki
 
 
-def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, enable_logging):
+def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
+			 enable_logging, stop_on_first_violation=True):
+	"""stop_on_first_violation:
+	  True  — end the replay as soon as one OOB write is confirmed tainted.  The
+	          run exits cleanly, because it stops before this recording's desync
+	          point (see the note at the top of the file).
+	  False — keep going and collect every violation.  The replay is then killed
+	          by SIGABRT at the desync point, so results are flushed to
+	          analysis1.json after every hit; see _write_analysis()."""
 	crashlogf = open(
 		tempfile.NamedTemporaryFile(
 			prefix="crash_info_", suffix=".log", dir=None, delete=False
@@ -138,6 +178,26 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		if enable_logging:
 			print(s, file=outfile)
 
+	def _write_analysis():
+		"""Flush the consolidated analysis to ./analysis1.json.
+
+		Called after every finalised hit, not only at the end, because in
+		run-to-completion mode the replay is eventually killed by SIGABRT at this
+		recording's desync point — and that cannot be rescued from Python.  rrr
+		runs __replay in a multiprocessing child (rrr/__init__.py:785), abort() is
+		raised inside libpanda from C, and a signal.signal() handler never gets to
+		run: CPython's handler only executes when the interpreter next checks
+		between bytecodes, which never happens because abort() terminates the
+		process as soon as its C trampoline returns.  Verified empirically — a
+		Python SIGABRT handler fires for os.kill() but not for a C abort().  So
+		results must be on disk BEFORE the crash; there is no writing them after."""
+		analysis['memcpy_hit_ctr'] = memcpy_hit_ctr
+		analysis['kasan_check_write_hit_ctr'] = kasan_check_write_hit_ctr
+		analysis['total_taint_labels'] = kdo_label_nr - 1
+		analysis['process_mappings'] = len(pm.mappings)
+		with open('./analysis1.json', 'w') as f:
+			f.write(json.dumps(analysis, indent=2))
+
 	def enable_taint():
 		if not panda.taint_enabled():
 			panda.taint_enable()
@@ -148,12 +208,69 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		if not panda.taint_enabled():
 			return None
 		taint_paddr = panda.virt_to_phys(cpu, addr)
+		if taint_paddr == 0xFFFFFFFFFFFFFFFF:
+			# Untranslatable — do not hand -1 to taint_get_ram, and do not let a
+			# translation failure masquerade as "untainted".
+			return None
 		result = panda.taint_get_ram(taint_paddr)
 		if result is None:
 			return None
 		return result.get_labels()
 
 	PAGE_SIZE = 0x1000
+
+	def v2p_range(cpu, base, length):
+		"""Translate [base, base+length) to physical addresses with one page-table
+		walk per PAGE, not per byte.  Returns `length` entries, each a paddr or
+		None if that page is unmapped.
+
+		A virtual page maps to one contiguous physical page, so translating every
+		byte separately repeats the same walk up to 4096 times.  That matters here
+		for more than speed: panda_virt_to_phys() -> cpu_get_phys_page_debug() is
+		the ONLY thing this analysis does that can reach address_space_ld*(), and
+		hence RR_DO_RECORD_OR_REPLAY().  In replay mode that macro has no
+		exemption for analysis-initiated accesses (rr_log_all.h:351-355): it calls
+		rr_replay_skipped_calls() and then consumes RR_INPUT entries from the log,
+		which desynchronises it and eventually aborts with "Ahead of log".  Every
+		other guest read we do goes through panda_physical_memory_rw(), which
+		explicitly refuses MMIO (common.h:117-136) and therefore cannot perturb
+		the log at all.  So the walk count is the analysis's entire exposure to
+		replay divergence, and this collapses it by three orders of magnitude."""
+		out = []
+		off = 0
+		while off < length:
+			va = base + off
+			chunk = min(PAGE_SIZE - (va & (PAGE_SIZE - 1)), length - off)
+			pa = panda.virt_to_phys(cpu, va)
+			if pa == 0xFFFFFFFFFFFFFFFF:
+				out.extend([None] * chunk)
+			else:
+				out.extend(range(pa, pa + chunk))
+			off += chunk
+		return out
+
+	def _in_repro(cpu):
+		"""True if the current process is the reproducer.
+
+		This asks OSI, i.e. it walks the guest task_struct — so it must only be
+		called once an address prefilter has already rejected the uninteresting
+		calls (see interesting_call_addrs).  on_call used to call this on EVERY
+		call instruction in the guest, which is where most of the analysis's guest
+		reads came from.
+
+		Deliberately NOT panda_current_asid() (env->cr[3]), which is register-only
+		and therefore tempting.  cr3 is not equivalent to `current`:
+		  - it over-matches: kernel threads have no mm and run on the previous
+		    task's page tables (lazy TLB), so a kworker scheduled after the repro
+		    still carries the repro's cr3;
+		  - it can under-match: with KPTI the kernel and user mappings are
+		    different PGDs, so one process has two cr3 values depending on the
+		    context you sample in, and PCID/noflush bits ride in the low and top
+		    bits.  Learning one value and comparing against the other silently
+		    stops matching — and every hook we care about fires in kernel context.
+		The prefilter gives us the speed without weakening the predicate."""
+		pname = process_name(panda, cpu)
+		return bool(pname) and bool(pattern.search(pname))
 
 	# cpu_index -> fault address recorded at handle_mm_fault entry.
 	# Keyed by CPU index so that SMP replays (multiple vCPUs) don't clobber
@@ -237,6 +354,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		'probe_fired': 0,
 		'hit': None,
 		'entry': None,        # analysis dict to fill in when we finish
+		'done': False,        # answer obtained; PANDA asked to stop, go inert
 	}
 
 	# rrr runs plain `nm` (no -S), so Func carries no size.  func_map is keyed by
@@ -297,10 +415,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		very next memory access with no retranslation."""
 		if on == _oob['watcher_on']:
 			return
+		# Nothing here but plist->enabled: memcb was turned on once at execve
+		# (_setup_oob_probe) and is never toggled again, so this cannot change
+		# helper selection or perturb the replay.
 		if on:
-			# No-op on the LLVM path (panda_use_memcb is only consulted by the
-			# TCG host backend) but needed if this ever runs without taint2.
-			panda.enable_memcb()
 			panda.enable_callback('oob_write_watcher')
 		else:
 			panda.disable_callback('oob_write_watcher')
@@ -311,8 +429,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		"""Translate-time gate.  Emitting the probe only for instructions inside
 		the storing function is what keeps the KASAN reporting path free of
 		instrumentation: those pcs live in other functions, answer False here,
-		and therefore cost nothing however many times they execute."""
-		return _oob['armed'] and _oob['lo'] <= pc < _oob['hi']
+		and therefore cost nothing however many times they execute.
+
+		Deliberately does NOT test _oob['armed'].  The range is static (the
+		storing function's extent), so this is enabled once at repro execve and
+		left alone — nothing translation-affecting then has to happen on the
+		kernel path around the store.  While disarmed the probe is a no-op."""
+		return _oob['lo'] <= pc < _oob['hi']
 
 	@panda.cb_after_insn_exec(name='oob_probe', enabled=False)
 	def oob_probe(cpu, pc):
@@ -439,17 +562,52 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 			}
 		log(f'oob probe: dst=0x{dst:x} size={size} outcome={outcome} reason={reason}')
 
+		# Get it on disk now — in run-to-completion mode nothing can be written
+		# once the replay hits its desync point.
+		_write_analysis()
+
+		# Only enabled-bit flips and Python state here — nothing that affects
+		# translation, so this is safe from on_ret as well as from the probe.
+		# The probe callback goes back off so bitmap_ip_add executions outside a
+		# window cost nothing; the gate stays on (see _setup_oob_probe).
 		_set_oob_watcher(False)
 		panda.disable_callback('oob_probe')
-		panda.disable_callback('oob_probe_gate')
 		_oob.update({'armed': False, 'dst': None, 'entry': None})
 
-	def _arm_oob_probe(cpu, dst, size, ret_pc, func_addr, hit, entry):
+		# Goal reached: stop the replay here, before it reaches the point where
+		# this recording desynchronises from its log (see the note at the top of
+		# the file).  Executing into that gains nothing and costs the result.
+		#
+		# Only 'tainted' ends the run.  An untainted or inconclusive hit must NOT,
+		# because a later hit may still be the tainted one — in the baseline run it
+		# is hit #2 that carries the labels.
+		if outcome == 'tainted' and stop_on_first_violation:
+			print('[analysis1] OOB taint confirmed — ending analysis before the '
+				  'replay reaches its divergence point')
+			# Go inert from here.  end_analysis() only *queues* the stop
+			# (queue_async(stop_run)), so hooks keep firing for a while yet — and
+			# it sets panda.ending, which makes pandare's enable_callback() a
+			# silent no-op (panda.py:2908-2916).  Any probe armed after this point
+			# therefore could never fire, and would report a bogus
+			# "INCONCLUSIVE / no write observed" for a store that did happen.
+			_oob['done'] = True
+			panda.end_analysis()
+		elif outcome == 'tainted':
+			print(f'[analysis1] OOB taint confirmed at hit #{hit} — collecting '
+				  f'further violations (stop_on_first_violation=False)')
+
+	def _arm_oob_probe(cpu, dst, size, func_addr, hit, entry):
 		"""Arm the destination-side probe for a flagged OOB write.
 
-		Must be called from AFTER_BLOCK_EXEC (i.e. from on_call): the dst->paddr
-		walk reads guest page tables, and flush_tb() needs a block boundary to be
-		honoured at."""
+		Deliberately does nothing translation-affecting: no callback enabling, no
+		flush_tb(), no global flag changes.  All of that happened once at repro
+		execve, in user context (see _setup_oob_probe).  Everything here is either
+		a read or a plain Python state update, so the record/replay stream around
+		the OOB store is left exactly as it would have been.
+
+		Still must be called from AFTER_BLOCK_EXEC (i.e. from on_call): the
+		dst->paddr walk reads guest page tables, which on_ret's comment warns is
+		unsafe from BEFORE_BLOCK_EXEC."""
 		if size <= 0 or size > 64:
 			print(f'[analysis1]   oob probe: implausible size={size} from '
 				  f'__kasan_check_write, falling back to 8')
@@ -458,19 +616,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		# Resolve dst -> physical addresses HERE, not in the probe.  Doing the
 		# page-table walk from inside translated code risks the
 		# RR_DO_RECORD_OR_REPLAY divergence documented on on_ret below.
-		paddrs = []
-		for off in range(size):
-			p = panda.virt_to_phys(cpu, dst + off)
-			paddrs.append(None if p == 0xFFFFFFFFFFFFFFFF else p)
+		paddrs = v2p_range(cpu, dst, size)
 
-		lo, hi = _function_extent(func_addr, ret_pc)
 		_oob.update({
 			'armed': True,
 			'dst': dst,
 			'size': size,
 			'paddrs': paddrs,
 			'func_addr': func_addr,
-			'lo': lo, 'hi': hi,
 			'store_seen': False,
 			'store_pc': None,
 			'store_val': None,
@@ -479,18 +632,53 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 			'hit': hit,
 			'entry': entry,
 		})
-
-		panda.enable_callback('oob_probe_gate')
+		# Plain plist->enabled flip — the helper is already emitted in
+		# bitmap_ip_add's blocks (the gate has been on since execve), so this needs
+		# no flush and changes nothing about translation.
 		panda.enable_callback('oob_probe')
-		# The gate is consulted at TRANSLATE time, and panda_enable_callback does
-		# not flush the TB cache — without this, blocks already translated carry
-		# no probe and it would simply never fire.  The flush is honoured at the
-		# next panda_callbacks_before_find_fast(); the `call __kasan_check_write`
-		# we are sitting on (and the `call __asan_store8` after it) both end
-		# blocks, so it lands well before the storing block is looked up.
-		panda.flush_tb()
 		print(f'[analysis1]   oob probe armed: dst=0x{dst:x} size={size} '
-			  f'gate=[0x{lo:x},0x{hi:x}) (watcher stays off until the report is done)')
+			  f'gate=[0x{_oob["lo"]:x},0x{_oob["hi"]:x}) '
+			  f'(watcher stays off until the KASAN report is done)')
+
+	def _setup_oob_probe():
+		"""One-time, translation-affecting setup for the OOB probe.
+
+		Done at repro execve, in user context, precisely so that none of it has to
+		happen later on the kernel path around the OOB store:
+		  - the gate range is the storing function's extent, which is static and
+		    needs no runtime information
+		  - panda_enable_callback does NOT flush the TB cache
+		    (callbacks.c:686-728), and the gate is consulted at TRANSLATE time, so
+		    a flush is required or already-translated blocks carry no probe
+		  - enable_memcb is set once and never toggled again: it is inert on the
+		    LLVM path that taint2 forces (tcg-llvm always emits the _panda
+		    helpers) but flipping it mid-replay would change helper selection for
+		    subsequently translated blocks
+		After this, arming and disarming a probe only flips plist->enabled bits."""
+		if bitmap_ip_add_addr is None:
+			print('[analysis1] OOB destination probe not set up: bitmap_ip_add not in symbol_map')
+			return
+		lo, hi = _function_extent(bitmap_ip_add_addr, bitmap_ip_add_addr)
+		_oob['lo'], _oob['hi'] = lo, hi
+		panda.enable_memcb()
+		# The GATE stays enabled for the rest of the replay so the probe helper is
+		# (re)emitted into bitmap_ip_add's blocks on every translation — including
+		# retranslations triggered by someone else, e.g. taint2's flush when
+		# taint_enable() switches to LLVM.  Disabling it would risk bitmap_ip_add
+		# being retranslated without instrumentation while we are not looking, and
+		# re-enabling would then need another flush.  Its cost is translate-time
+		# only: one Python call per instruction translated, bounded by the number
+		# of unique instructions, not by how often they execute.
+		panda.enable_callback('oob_probe_gate')
+		panda.flush_tb()
+		# The PROBE callback is left disabled and toggled per hit instead.  While
+		# disabled the C dispatcher skips it entirely, so bitmap_ip_add executions
+		# outside a probe window cost nothing at all — and enabling it is a plain
+		# plist->enabled flip needing no flush, because the helper is already in
+		# the generated code.
+		print(f'[analysis1] OOB destination probe set up: gate=[0x{lo:x},0x{hi:x}) '
+			  f'({hi - lo} bytes of bitmap_ip_add), flushed TB cache; '
+			  f'probe armed per hit')
 
 	def removeme_debug_dump(cpu, ptr):
 		"""REMOVEME: dump the region [_dbg_dump_base, ptr) as 8-byte quads.
@@ -523,6 +711,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 			addr += 8
 		_dbg_dump_next = ptr
 
+	# Call targets on_call actually does something for.  Testing membership here is
+	# a set lookup with no guest reads, which is what lets the OSI-based process
+	# check in _in_repro() stay correct without running on every call instruction.
+	interesting_call_addrs = {a for a in (
+		asan_memcpy_addr, kasan_check_write_addr, kdo_store_cb_addr,
+		sink_addr, panic_addr, handle_mm_fault_addr,
+	) if a is not None}
+
 	def on_ret(cpu, addr):
 		"""Hook on handle_mm_fault return.
 
@@ -544,6 +740,19 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		aborts with "Ahead of log / FOUND DISAGREEMENT".
 		VMA classification is deferred to the on_call drain (AFTER_BLOCK_EXEC).
 		"""
+		if _oob['done']:
+			return
+
+		# Address prefilter first — no guest reads — then the OSI process check.
+		# on_ret previously had no process filter at all, which is why it kept
+		# reporting "no pending entry": it fired for handle_mm_fault returns in
+		# other processes, where on_call had (correctly) recorded nothing.
+		if addr != handle_mm_fault_addr and not (
+				_oob['armed'] and addr == _oob['func_addr']):
+			return
+		if not _in_repro(cpu):
+			return
+
 		# OOB probe terminal condition: the flagged function has returned.  If no
 		# write to dst was ever observed then the store did not execute — a
 		# distinct outcome from "the store executed and carried no taint".
@@ -575,18 +784,31 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
 		nonlocal refresh_pending
 
-		# Only care about calls from the reproducer process
-		pname = panda.get_process_name(cpu)
-		if not pattern.search(pname):
+		# Answer already obtained and the stop queued — see _oob['done'].
+		if _oob['done']:
 			return
 
-		# OOB probe: any call out of the flagged function leaves the region we
-		# care about — notably __asan_store8, which runs its own KASAN report.
-		# Turn the write watcher off for the duration; the next probe firing back
-		# inside the function turns it on again.  Without this the second report
-		# runs with a Python callback on every guest write.
+		# OOB probe callee guard.  Must run for EVERY call, ahead of the prefilter
+		# below: the call we most need to catch is __asan_store8 (it runs its own
+		# KASAN report), and that is deliberately not in interesting_call_addrs.
+		# Any call at all while the watcher is on means we are leaving the flagged
+		# function, since the watcher is only ever on while executing directly
+		# inside it — so no process check is needed either.  One dict lookup.
 		if _oob['watcher_on']:
 			_set_oob_watcher(False)
+
+		# Cheap, guest-read-free rejection next.  The overwhelming majority of
+		# call instructions are not interesting, and deciding that with a set
+		# lookup is what keeps the OSI task_struct walk in _in_repro() off the hot
+		# path — it used to run on every single call instruction in the guest.
+		# Pending drains still have to get through, hence the second clause.
+		if addr not in interesting_call_addrs and not (
+				refresh_pending or zero_page_pending):
+			return
+
+		# Only care about calls from the reproducer process.
+		if not _in_repro(cpu):
+			return
 
 		# Drain a deferred pm.refresh() requested by on_sys_mmap_return.
 		# on_call fires from AFTER_BLOCK_EXEC — the first user-space TB after the
@@ -626,10 +848,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 			first_label = kdo_label_nr
 			print(f'[analysis1] on_call drain: zero-page labels starting at {first_label} for page 0x{page_base:x} (vma {containing_vma["name"]} 0x{containing_vma["base"]:x}+{containing_vma["size"]})')
 			untranslatable = 0
+			# One page-table walk for the whole page instead of 4096 — see v2p_range.
+			page_paddrs = v2p_range(cpu, page_base, PAGE_SIZE)
 			for offset in range(PAGE_SIZE):
 				virt_addr   = page_base + offset
-				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
-				if taint_paddr == 0xFFFFFFFFFFFFFFFF:
+				taint_paddr = page_paddrs[offset]
+				if taint_paddr is None:
 					untranslatable += 1
 					continue
 				label_map[kdo_label_nr] = {
@@ -725,11 +949,17 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 				'len': length,
 				'backtrace': backtrace,
 			}
+			store_paddrs = v2p_range(cpu, ptr, length)
+			untranslatable = 0
 			for offset in range(length):
-				virt_addr = ptr + offset
-				taint_paddr = panda.virt_to_phys(cpu, virt_addr)
+				taint_paddr = store_paddrs[offset]
+				if taint_paddr is None:
+					# Previously this handed -1 straight to taint_label_ram.
+					untranslatable += 1
+					continue
 				panda.taint_label_ram(taint_paddr, call_label)
-			print(f'[analysis1]   tainted {length} bytes with label {call_label}')
+			print(f'[analysis1]   tainted {length - untranslatable}/{length} bytes '
+				  f'with label {call_label}')
 			return
 
 		if sink_addr is not None and addr == sink_addr:
@@ -779,7 +1009,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 
 			if is_target:
 				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('copy_to_urb_memcpy_calls', [])) + 1} at memcpy call #{memcpy_hit_ctr} ***")
-				print(f"[analysis1] __asan_memcpy #{memcpy_hit_ctr} in '{pname}' from_copy_to_urb={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
+				print(f"[analysis1] __asan_memcpy #{memcpy_hit_ctr} in '{process_name(panda, cpu)}' from_copy_to_urb={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
 				log(f'__asan_memcpy call #{memcpy_hit_ctr} (from_copy_to_urb={is_target}):')
 
 				# void *__asan_memcpy(void *to, const void *from, uptr size)
@@ -813,7 +1043,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 
 			if is_target:
 				print(f"[analysis1] *** TARGET HIT #{len(analysis.get('bitmap_ip_add_kasan_check_writes', [])) + 1} at kasan_check_write call #{kasan_check_write_hit_ctr} ***")
-				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{pname}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
+				print(f"[analysis1] __kasan_check_write #{kasan_check_write_hit_ctr} in '{process_name(panda, cpu)}' from_bitmap_ip_add={is_target} caller={hex(immediate_caller) if immediate_caller else 'none'}")
 	
 				ptr  = panda.arch.get_arg(cpu, 0)
 				size = panda.arch.get_arg(cpu, 1)
@@ -839,9 +1069,20 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 					val = None
 				if val is not None:
 					slot_labels = set()
-					for byte_off in range(read_len):
-						baddr = panda.virt_to_phys(cpu, value_slot + byte_off)
-						if baddr == 0xFFFFFFFFFFFFFFFF:
+					# taint_get_ram() raises if taint2 has not been enabled yet
+					# (pandare's _assert_taint_enabled).  Nothing guarantees it has
+					# been by the time we get here: every enable_taint() call site
+					# sits behind a successful VMA lookup, so an OOB hit that lands
+					# before the first heap fault — or any run with the VMA walk
+					# disabled — would take the exception instead of reporting.
+					if not panda.taint_enabled():
+						print('[analysis1]   taint2 not enabled yet — skipping '
+							  'source-slot taint read for this hit')
+					slot_paddrs = v2p_range(cpu, value_slot, read_len) \
+						if panda.taint_enabled() else []
+					for byte_off in range(len(slot_paddrs)):
+						baddr = slot_paddrs[byte_off]
+						if baddr is None:
 							continue
 						result = panda.taint_get_ram(baddr)
 						if result is not None:
@@ -872,14 +1113,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 
 				# Source-side taint (above) only shows the value heading for the
 				# store.  Arm the destination-side probe to confirm the taint on
-				# the bytes actually written out of bounds.  immediate_caller is
-				# the return address, i.e. where control resumes inside
-				# bitmap_ip_add once the KASAN report is done.
+				# the bytes actually written out of bounds.  The gate is already
+				# live from execve; this only records dst/size and resets the
+				# per-hit state.
 				if _oob['armed']:
 					print(f'[analysis1]   oob probe still armed from hit #{_oob["hit"]} — '
 						  f'closing it out before re-arming')
 					_finish_oob('superseded by a later kasan_check_write target hit')
-				_arm_oob_probe(cpu, ptr, size, immediate_caller, bitmap_ip_add_addr,
+				_arm_oob_probe(cpu, ptr, size, bitmap_ip_add_addr,
 							   kasan_check_write_hit_ctr, entry)
 				return
 
@@ -900,11 +1141,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 		print(f"[analysis1] repro execve detected: {fname} — enabling on_call and on_ret hooks")
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
+		# Do the probe's translation-affecting setup here, in user context, so the
+		# kernel path around the OOB store needs none of it.
+		_setup_oob_probe()
 		panda.disable_ppp("on_sys_execve_enter")
 
 	@panda.ppp("syscalls2", "on_sys_mmap_enter")
 	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
-		if not pattern.search(panda.get_process_name(cpu)):
+		if not _in_repro(cpu):
 			return
 		print(
 			f'[analysis1] mmap enter: hint=0x{addr_hint:x} len=0x{length:x} '
@@ -914,7 +1158,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 	@panda.ppp("syscalls2", "on_sys_mmap_return")
 	def on_sys_mmap_return(cpu, pc, addr_hint, length, prot, flags, fd, offset):
 		nonlocal refresh_pending
-		if not pattern.search(panda.get_process_name(cpu)):
+		if not _in_repro(cpu):
 			return
 		ret = panda.arch.get_retval(cpu)
 		print(
@@ -930,46 +1174,58 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map, e
 	@panda.ppp("syscalls2", "on_sys_brk_return")
 	def on_sys_brk_return(cpu, pc, brk):
 		nonlocal refresh_pending
-		if not pattern.search(panda.get_process_name(cpu)):
+		if not _in_repro(cpu):
 			return
 		ret = panda.arch.get_retval(cpu)
 		print(f'[analysis1] brk return: new_brk=0x{ret:x} (requested=0x{brk:x})')
 		# Same reasoning as mmap: defer the refresh to on_call.
 		refresh_pending = True
 
-	print(f'[analysis1] replay start: record={record}')
+	print(f'[analysis1] replay start: record={record} '
+		  f'(stop_on_first_violation={stop_on_first_violation})')
 	try:
 		panda.run_replay(record)
 	except Exception:
+		# Catches Python-level failures anywhere in the analysis so the summary and
+		# the consolidated JSON below still get produced.  It canNOT catch the
+		# SIGABRT this recording ends in — see _write_analysis() — which is why
+		# every hit is already flushed as it is finalised.
 		print("[analysis1] caught exception during replay")
 		print(traceback.format_exc())
+	finally:
+		outfile.close()
+		print('[analysis1] replay done!')
 
-	outfile.close()
-	print('[analysis1] replay done!')
+		end = time.time()
+		total_labels = kdo_label_nr - 1  # labels are 1-based
+		print(f'[analysis1] time: {end - start:.1f}s')
+		print(f'[analysis1] total __asan_memcpy calls in repro: {memcpy_hit_ctr}')
+		print(f'[analysis1] copy_to_urb target hits: {len(analysis.get("copy_to_urb_memcpy_calls", []))}')
+		print(f'[analysis1] total __kasan_check_write calls in repro: {kasan_check_write_hit_ctr}')
+		print(f'[analysis1] bitmap_ip_add target hits: {len(analysis.get("bitmap_ip_add_kasan_check_writes", []))}')
+		_hits = analysis.get('bitmap_ip_add_kasan_check_writes', [])
+		_oob_outcomes = [e.get('oob_dst', {}).get('outcome', 'probe-never-finished')
+						 for e in _hits]
+		print(f'[analysis1] OOB destination probe outcomes per hit: {_oob_outcomes}')
+		print(f'[analysis1] OOB writes confirmed tainted: '
+			  f'{_oob_outcomes.count("tainted")}/{len(_hits)}')
+		print(f'[analysis1] cached process mappings: {len(pm.mappings)}')
+		print(f'[analysis1] total taint labels created: {total_labels}')
 
-	end = time.time()
-	total_labels = kdo_label_nr - 1  # labels are 1-based
-	print(f'[analysis1] time: {end - start:.1f}s')
-	print(f'[analysis1] total __asan_memcpy calls in repro: {memcpy_hit_ctr}')
-	print(f'[analysis1] copy_to_urb target hits: {len(analysis.get("copy_to_urb_memcpy_calls", []))}')
-	print(f'[analysis1] total __kasan_check_write calls in repro: {kasan_check_write_hit_ctr}')
-	print(f'[analysis1] bitmap_ip_add target hits: {len(analysis.get("bitmap_ip_add_kasan_check_writes", []))}')
-	_oob_outcomes = [e.get('oob_dst', {}).get('outcome', 'probe-never-finished')
-					 for e in analysis.get('bitmap_ip_add_kasan_check_writes', [])]
-	print(f'[analysis1] OOB destination probe outcomes per hit: {_oob_outcomes}')
-	print(f'[analysis1] cached process mappings: {len(pm.mappings)}')
-	print(f'[analysis1] total taint labels created: {total_labels}')
-
-	analysis['memcpy_hit_ctr'] = memcpy_hit_ctr
-	analysis['kasan_check_write_hit_ctr'] = kasan_check_write_hit_ctr
-	analysis['replay_time'] = end - start
-	analysis['total_taint_labels'] = total_labels
-	analysis['process_mappings'] = len(pm.mappings)
-	with open('./analysis1.json', 'w') as f:
-		f.write(json.dumps(analysis, indent=2))
+		analysis['replay_time'] = end - start
+		_write_analysis()
 
 
-def replay(rootfs, kernel, enable_logging=True, record='record'):
+def replay(rootfs, kernel, enable_logging=True, record='record',
+		   stop_on_first_violation=True):
+	"""stop_on_first_violation:
+	  True  (default) — return as soon as one OOB write is confirmed tainted.
+	                    Exits cleanly.
+	  False           — run to the end of the analysis, collecting every
+	                    violation.  This recording then dies of SIGABRT at its
+	                    desync point, so rrr will raise "Replay failed -6" even
+	                    though analysis1.json holds every hit collected up to
+	                    that point (it is rewritten after each one)."""
 	print("starting")
 	rrr.replay(rootfs, kernel, record, __replay,
-			   additional_args=[enable_logging])
+			   additional_args=[enable_logging, stop_on_first_violation])

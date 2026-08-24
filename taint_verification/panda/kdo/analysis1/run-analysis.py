@@ -36,6 +36,7 @@ class NestablePool(multiprocessing.pool.Pool):
 		super(NestablePool, self).__init__(*args, **kwargs)
 
 share_path = None
+multi_shot = False
 
 def doit(repro):
 	os.chdir("/root/out")
@@ -72,7 +73,21 @@ def doit(repro):
 		else:
 			print(f"[run-analysis] warning: repro binary not found at {repro_bin}")
 
-	analysis1.replay(rootfs, kernel)
+	if multi_shot:
+		# A multi-shot run deliberately keeps going past the first confirmed
+		# violation, which means it runs into this recording's desync point and is
+		# killed by SIGABRT — rrr surfaces that as "Replay failed -6".  Every hit
+		# has already been flushed to analysis1.json by then, so report it and
+		# carry on rather than letting one expected abort take down the whole
+		# pool.map batch.
+		try:
+			analysis1.replay(rootfs, kernel, stop_on_first_violation=False)
+		except Exception as e:
+			print(f"[run-analysis] {repro_id}: replay ended with {e!r} — expected "
+				  f"in --multi-shot; results already written to analysis1.json")
+			return 'aborted-after-collection'
+	else:
+		analysis1.replay(rootfs, kernel)
 
 	return True
 
@@ -86,10 +101,16 @@ def main() -> None:
 	opts.add_argument('--rerun', action='store_true', help='rerun the analysis only for the undone')
 	opts.add_argument('--share-path', type=str, required=False,
 			help='host share directory containing <repro_id>/repro binaries (for symbol parsing)')
+	opts.add_argument('--multi-shot', action='store_true',
+			help='collect every OOB violation instead of stopping at the first '
+				 'confirmed one; analysis1.json is rewritten after each hit')
 	args = opts.parse_args()
 
-	global share_path
+	global share_path, multi_shot
 	share_path = args.share_path
+	multi_shot = args.multi_shot
+	if multi_shot:
+		print('[run-analysis] --multi-shot: collecting all violations')
 
 	analysis1.update_config()
 
