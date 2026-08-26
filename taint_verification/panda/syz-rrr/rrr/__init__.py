@@ -704,7 +704,21 @@ def record(kernel, rootfs, timeout, record_func=__record, output="record", addit
 
     p = multiprocessing.Process(target=record_func, args=args)
     p.start()
-    p.join(timeout=timeout)
+
+    # Poll rather than p.join(timeout=timeout) directly: on Linux, p.join with a
+    # timeout blocks on select() against the sentinel fd, which is only signalled
+    # when the child's Popen object is GC'd — not when the process actually exits.
+    # This causes the parent to hang indefinitely after the child has already
+    # finished.  Polling p.exitcode (set by waitpid as soon as the OS reaps the
+    # child) sidesteps the issue entirely.
+    POLL_INTERVAL = 2  # seconds
+    elapsed = 0
+    while elapsed < timeout:
+        p.join(timeout=POLL_INTERVAL)
+        if p.exitcode is not None:
+            break
+        elapsed += POLL_INTERVAL
+
     print(f'recording completed, rv {p.exitcode}')
 
     if p.exitcode is None:
