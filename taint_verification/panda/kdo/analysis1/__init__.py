@@ -202,6 +202,16 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if not panda.taint_enabled():
 			panda.taint_enable()
 
+	def _taint_labels_for_paddr(paddr):
+		"""Return the set of taint labels on physical address `paddr`, or None.
+
+		Does NOT check taint_enabled() — callers must guard that themselves so
+		the None return unambiguously means "untainted", not "taint off"."""
+		result = panda.taint_get_ram(paddr)
+		if result is None:
+			return None
+		return result.get_labels()
+
 	def get_taint_labels(cpu, addr):
 		"""Return the set of taint labels on the byte at virtual address `addr`,
 		or None if taint is not yet enabled or the byte is untainted."""
@@ -212,10 +222,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			# Untranslatable — do not hand -1 to taint_get_ram, and do not let a
 			# translation failure masquerade as "untainted".
 			return None
-		result = panda.taint_get_ram(taint_paddr)
-		if result is None:
-			return None
-		return result.get_labels()
+		return _taint_labels_for_paddr(taint_paddr)
 
 	PAGE_SIZE = 0x1000
 
@@ -488,8 +495,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				if paddr is None:
 					untranslatable += 1
 					continue
-				result = panda.taint_get_ram(paddr)
-				labels = result.get_labels() if result is not None else None
+				labels = _taint_labels_for_paddr(paddr)
 				if labels:
 					resolved = [label_map[l] for l in labels if l in label_map]
 					tainted_bytes[off] = {'labels': list(labels), 'resolved': resolved}
@@ -1016,75 +1022,22 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	
 				ptr  = panda.arch.get_arg(cpu, 0)
 				size = panda.arch.get_arg(cpu, 1)
-
-				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
-
-				# Call site is bitmap_ip_add+0x3bb (retaddr +0x3c0).  Disassembly:
-				#   +970  mov 0x18(%rsp),%rax   ← destination address (== ptr / arg0)
-				#   +975  mov 0x10(%rsp),%rdx   ← value to be written
-				#   +980  mov %rdx,(%rax)       ← the actual store
-				# So rsp+0x10 holds the value; rsp+0x18 is the destination (already
-				# captured in ptr above).  rsp+0x08 is unrelated to this call site.
-				rsp = panda.arch.get_reg(cpu, 'rsp')
-				value_slot = rsp + 0x10
-				read_len = min(size, 8) if size > 0 else 8
-				log(f'  write target=0x{ptr:x} size={size} value_slot=rsp+0x10=0x{value_slot:x} (store not yet executed)')
-				tainted_src = {}
-				try:
-					raw = panda.virtual_memory_read(cpu, value_slot, read_len)
-					val = int.from_bytes(raw, 'little')
-				except Exception as e:
-					log(f'  rsp+0x10=0x{value_slot:x} unreadable: {e}')
-					val = None
-				if val is not None:
-					slot_labels = set()
-					# taint_get_ram() raises if taint2 has not been enabled yet
-					# (pandare's _assert_taint_enabled).  Nothing guarantees it has
-					# been by the time we get here: every enable_taint() call site
-					# sits behind a successful VMA lookup, so an OOB hit that lands
-					# before the first heap fault — or any run with the VMA walk
-					# disabled — would take the exception instead of reporting.
-					if not panda.taint_enabled():
-						print('[analysis1]   taint2 not enabled yet — skipping '
-							  'source-slot taint read for this hit')
-					slot_paddrs = v2p_range(cpu, value_slot, read_len) \
-						if panda.taint_enabled() else []
-					for byte_off in range(len(slot_paddrs)):
-						baddr = slot_paddrs[byte_off]
-						if baddr is None:
-							continue
-						result = panda.taint_get_ram(baddr)
-						if result is not None:
-							slot_labels.update(result.get_labels())
-					resolved = [label_map[l] for l in slot_labels if l in label_map]
-					log(f'  rsp+0x10=0x{value_slot:x} val=0x{val:x} labels={slot_labels} resolved={resolved}')
-					print(f'[analysis1]   write target=0x{ptr:x}  value=0x{val:x}  taint_labels={slot_labels}  resolved={resolved}')
-					if slot_labels:
-						tainted_src['rsp+0x10'] = {
-							'val': hex(val),
-							'labels': list(slot_labels),
-							'resolved': resolved,
-						}
-				else:
-					print(f'[analysis1]   write target=0x{ptr:x}  value=<unreadable> (rsp=0x{rsp:x})')
 	
-				if not tainted_src:
-					print(f'[analysis1]   no taint on write value (rsp+0x10=0x{value_slot:x})')
-
+				log(f'__kasan_check_write call #{kasan_check_write_hit_ctr} (from_bitmap_ip_add={is_target}):')
+				log(f'  write target=0x{ptr:x} size={size} (store not yet executed)')
+				print(f'[analysis1]   write target=0x{ptr:x} size={size}')
+	
 				entry = {
 					'hit': kasan_check_write_hit_ctr,
 					'backtrace': [hex(a) for a in callers],
 					'ptr': hex(ptr),
 					'size': size,
-					'tainted_src': tainted_src,
 				}
 				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append(entry)
 
-				# Source-side taint (above) only shows the value heading for the
-				# store.  Arm the destination-side probe to confirm the taint on
-				# the bytes actually written out of bounds.  The gate is already
-				# live from execve; this only records dst/size and resets the
-				# per-hit state.
+				# Arm the destination-side probe to confirm taint on the bytes
+				# actually written out of bounds.  The gate is already live from
+				# execve; this only records dst/size and resets the per-hit state.
 				if _oob['armed']:
 					print(f'[analysis1]   oob probe still armed from hit #{_oob["hit"]} — '
 						  f'closing it out before re-arming')
