@@ -18,6 +18,7 @@ import faulthandler
 import tempfile
 
 pattern = re.compile(r"\brepro$")
+kworker_pattern = re.compile(r"^kworker/")
 
 from .mappings import ProcessMappings
 from cffi import FFI
@@ -56,6 +57,7 @@ def process_name(panda, cpu):
 analysis = dict()
 memcpy_hit_ctr = 0
 kasan_check_write_hit_ctr = 0
+kasan_check_range_hit_ctr = 0
 kdo_label_nr = 1
 
 # REMOVEME: debug dump state for kasan_check_write target hits
@@ -132,15 +134,36 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# Maps label ID (int) -> {'virt_addr': hex str, 'backtrace': [hex str, ...]}
 	label_map = {}
 
-	asan_memcpy_addr = symbol_map.get('__asan_memcpy', None).address
+	asan_memcpy_sym  = symbol_map.get('__asan_memcpy', None)
+	asan_memcpy_addr = asan_memcpy_sym.address if asan_memcpy_sym else None
 	kasan_check_write_sym = symbol_map.get('__kasan_check_write', None)
 	kasan_check_write_addr = kasan_check_write_sym.address if kasan_check_write_sym else None
+	kasan_check_range_sym = symbol_map.get('kasan_check_range', None)
+	kasan_check_range_addr = kasan_check_range_sym.address if kasan_check_range_sym else None
+	kasan_report_sym  = symbol_map.get('kasan_report', None)
+	kasan_report_addr = kasan_report_sym.address if kasan_report_sym else None
+	copy_to_iter_sym = symbol_map.get('_copy_to_iter', None)
+	copy_to_iter_addr = copy_to_iter_sym.address if copy_to_iter_sym else None
+	p9_read_work_sym = symbol_map.get('p9_read_work', None)
+	p9_read_work_addr = p9_read_work_sym.address if p9_read_work_sym else None
 	copy_to_urb_sym = (symbol_map.get('copy_to_urb.constprop.0', None)
 	                   or symbol_map.get('copy_to_urb', None))
 	copy_to_urb_addr = copy_to_urb_sym.address if copy_to_urb_sym else None
 	bitmap_ip_add_sym = symbol_map.get('bitmap_ip_add', None)
 	bitmap_ip_add_addr = bitmap_ip_add_sym.address if bitmap_ip_add_sym else None
-	panic_addr            = symbol_map.get('panic',             None).address
+	# 'memcpy' appears in both vmlinux and the repro binary; symbol_map[name]
+	# is last-writer-wins so the repro's userspace entry clobbers the kernel
+	# one.  func_map is keyed by address so both entries coexist there.
+	_KERNEL_TEXT_MIN = 0xffffffff00000000
+	memcpy_addr = next(
+		(addr for addr, f in func_map.items()
+		 if f.symbol == 'memcpy' and addr >= _KERNEL_TEXT_MIN),
+		None
+	)
+	print(f'[analysis1] kernel memcpy lookup: '
+	      f'{hex(memcpy_addr) if memcpy_addr else "NOT FOUND — func_map memcpy entries: " + str([(hex(a), f.symbol) for a, f in func_map.items() if f.symbol == "memcpy"])}')
+	panic_sym             = symbol_map.get('panic', None)
+	panic_addr            = panic_sym.address if panic_sym else None
 	kdo_store_cb_sym      = symbol_map.get('kdo_store_callback', None)
 	kdo_store_cb_addr     = kdo_store_cb_sym.address if kdo_store_cb_sym else None
 	sink_sym              = symbol_map.get('sink', None)
@@ -162,14 +185,21 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# next instruction: copy_to_urb+0x309.
 	copy_to_urb_memcpy_retaddr = copy_to_urb_addr + 0x309 if copy_to_urb_addr is not None else None
 	bitmap_ip_add_kasan_retaddr = bitmap_ip_add_addr + 0x3c0 if bitmap_ip_add_addr is not None else None
+	copy_to_iter_kasan_range_retaddr = copy_to_iter_addr + 0x997 if copy_to_iter_addr is not None else None
+	p9_read_work_filter_addr = p9_read_work_addr + 0x1f0 if p9_read_work_addr is not None else None
 
-	print(f'__asan_memcpy addr:         {hex(asan_memcpy_addr)}')
+	print(f'__asan_memcpy addr:         {hex(asan_memcpy_addr) if asan_memcpy_addr else "NOT FOUND"}')
 	print(f'__kasan_check_write addr:   {hex(kasan_check_write_addr) if kasan_check_write_addr else "NOT FOUND"}')
+	print(f'kasan_check_range addr:     {hex(kasan_check_range_addr) if kasan_check_range_addr else "NOT FOUND"}')
 	print(f'copy_to_urb addr:           {hex(copy_to_urb_addr) if copy_to_urb_addr is not None else "NOT FOUND"}')
 	print(f'copy_to_urb memcpy retaddr: {hex(copy_to_urb_memcpy_retaddr) if copy_to_urb_memcpy_retaddr is not None else "NOT FOUND"}')
 	print(f'bitmap_ip_add addr:         {hex(bitmap_ip_add_addr) if bitmap_ip_add_addr else "NOT FOUND"}')
 	print(f'bitmap_ip_add kasan retaddr:{hex(bitmap_ip_add_kasan_retaddr) if bitmap_ip_add_kasan_retaddr else "NOT FOUND"}')
-	print(f'panic addr:                 {hex(panic_addr)}')
+	print(f'_copy_to_iter addr:         {hex(copy_to_iter_addr) if copy_to_iter_addr else "NOT FOUND"}')
+	print(f'_copy_to_iter kasan retaddr:{hex(copy_to_iter_kasan_range_retaddr) if copy_to_iter_kasan_range_retaddr else "NOT FOUND"}')
+	print(f'p9_read_work filter addr:   {hex(p9_read_work_filter_addr) if p9_read_work_filter_addr else "NOT FOUND"}')
+	print(f'kasan_report addr:          {hex(kasan_report_addr) if kasan_report_addr else "NOT FOUND"}')
+	print(f'panic addr:                 {hex(panic_addr) if panic_addr else "NOT FOUND"}')
 	print(f'kdo_store_callback addr:    {hex(kdo_store_cb_addr) if kdo_store_cb_addr else "NOT FOUND"}')
 	print(f'sink addr:                  {hex(sink_addr) if sink_addr else "NOT FOUND"}')
 	print(f'handle_mm_fault addr:       {hex(handle_mm_fault_addr) if handle_mm_fault_addr else "NOT FOUND"}')
@@ -193,6 +223,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		results must be on disk BEFORE the crash; there is no writing them after."""
 		analysis['memcpy_hit_ctr'] = memcpy_hit_ctr
 		analysis['kasan_check_write_hit_ctr'] = kasan_check_write_hit_ctr
+		analysis['kasan_check_range_hit_ctr'] = kasan_check_range_hit_ctr
 		analysis['total_taint_labels'] = kdo_label_nr - 1
 		analysis['process_mappings'] = len(pm.mappings)
 		with open('./analysis1.json', 'w') as f:
@@ -279,6 +310,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		pname = process_name(panda, cpu)
 		return bool(pname) and bool(pattern.search(pname))
 
+	def _in_kworker(cpu):
+		"""True if the current process is any kworker thread.
+
+		Used to gate kasan_check_range and kasan_report: the p9_read_work bug
+		executes entirely inside a kworker, never inside the repro process."""
+		pname = process_name(panda, cpu)
+		return bool(pname) and bool(kworker_pattern.match(pname))
+
 	# cpu_index -> fault address recorded at handle_mm_fault entry.
 	# Keyed by CPU index so that SMP replays (multiple vCPUs) don't clobber
 	# each other; in practice kdo replays are single-CPU, but the guard is free.
@@ -351,8 +390,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		'dst': None,          # destination ptr flagged by __kasan_check_write
 		'size': 0,
 		'paddrs': [],         # dst byte offset -> paddr, resolved at arm time
-		'func_addr': None,    # entry pc of the function performing the store
-		'lo': 0, 'hi': 0,     # gate pc range
+		'armed_by': None,     # process name (task_struct->comm) that armed the probe
+		'lo': 0, 'hi': 0,     # gate pc range (kernel text, set once at first arm)
 		'watcher_on': False,
 		'store_seen': False,  # a write overlapping dst has landed
 		'store_pc': None,
@@ -362,6 +401,21 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		'hit': None,
 		'entry': None,        # analysis dict to fill in when we finish
 		'done': False,        # answer obtained; PANDA asked to stop, go inert
+		# Call-depth shadow stack for the armed process.
+		# Set to 1 at arm time (we are inside kasan_check_range, one level above
+		# the storing function).  on_ret for the armed process decrements it:
+		#   depth 1→0: we are back in the storing function — enable probe+watcher
+		#   depth 0→-1: we have returned past the arm point — finish the probe
+		# on_call for the armed process increments it and disables probe+watcher.
+		# This replaces the old func_addr/func_name boundary check and correctly
+		# handles stores in tail-called / jumped-to functions (e.g. memcpy →
+		# __memcpy → memcpy_orig) without caring about PC ranges at all.
+		'depth': 0,
+		# Set to True when kasan_report fires while this probe is armed.
+		# kasan_report is only ever called by KASAN when a range check fails,
+		# so it is the unambiguous signal that the write is genuinely OOB.
+		# _finish_oob will not stop the replay unless this flag is set.
+		'oob_confirmed': False,
 	}
 
 	# rrr runs plain `nm` (no -S), so Func carries no size.  func_map is keyed by
@@ -369,21 +423,53 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# upper bound for its extent.
 	_sym_addrs = sorted(func_map.keys())
 
-	def _function_extent(func_addr, ret_pc, fallback=50):
-		"""(lo, hi) pc range to instrument: from `ret_pc` (where control resumes
-		after the KASAN check) to the end of the function at `func_addr`.
+	def _function_extent(func_addr, fallback=256):
+		"""(lo, hi) pc range to instrument: the full extent of the function at
+		`func_addr`, from its entry point to the next symbol in the nm table.
 
-		nm also reports data symbols, so an implausibly large extent is clamped
-		back to the ret_pc + fallback window.  Over-wide is harmless — the range
-		only has to contain the store and exclude other functions."""
+		lo is always func_addr.  Using ret_pc (the address after the KASAN check
+		call) as lo was an attempted optimisation to skip the KASAN report path,
+		but it breaks when the report is an out-of-line block at a higher offset
+		than the store: the report lives above the store, execution jumps back
+		below ret_pc to do the actual store, and the probe helper was never
+		emitted there.  The report path is in *other functions*
+		(__asan_report_store4_noabort etc.), so oob_probe_gate already returns
+		False for those PCs without any help from lo — they cost nothing.
+
+		nm also reports data symbols, so an implausibly large next-symbol gap is
+		clamped back to func_addr + fallback.  Over-wide is harmless — the range
+		only has to contain the store instruction and exclude other functions."""
 		i = bisect.bisect_right(_sym_addrs, func_addr)
-		hi = _sym_addrs[i] if i < len(_sym_addrs) else None
-		if hi is None or hi - func_addr > 0x2000:
-			hi = ret_pc + fallback
-		# Never return less than the fallback window: a stray intra-function
-		# symbol would otherwise put the store outside the gated range, which
-		# degrades to a 'store_not_read' verdict instead of an answer.
-		return ret_pc, max(hi, ret_pc + fallback)
+		next_sym = _sym_addrs[i] if i < len(_sym_addrs) else None
+		func_name = func_map.get(func_addr, None)
+		func_label = func_name.symbol if func_name else hex(func_addr)
+
+		if next_sym is None:
+			hi = func_addr + fallback
+			print(f'[analysis1] _function_extent: 0x{func_addr:x} ({func_label}): '
+				  f'no next symbol in nm table — using fallback hi=0x{hi:x} (+{fallback:#x}); '
+				  f'store may be missed if it lies beyond the fallback window')
+		elif next_sym - func_addr > 0x40000:
+			gap = next_sym - func_addr
+			hi = func_addr + fallback
+			print(f'[analysis1] _function_extent: 0x{func_addr:x} ({func_label}): '
+				  f'next nm symbol 0x{next_sym:x} is {gap:#x} bytes away — '
+				  f'likely a data symbol, clamping to fallback hi=0x{hi:x} (+{fallback:#x}); '
+				  f'store may be missed if it lies beyond the fallback window')
+		else:
+			hi = next_sym
+			extent = hi - func_addr
+			if extent > 0x8000:
+				# Warn on suspiciously large but accepted extents: the next nm
+				# symbol might itself be a cold/out-of-line block rather than a
+				# true function boundary, silently over-gating.
+				print(f'[analysis1] _function_extent: 0x{func_addr:x} ({func_label}): '
+					  f'gate extent is {extent:#x} bytes (to next sym 0x{hi:x}) — '
+					  f'unusually large; verify this is the correct function boundary')
+			else:
+				print(f'[analysis1] _function_extent: 0x{func_addr:x} ({func_label}): '
+					  f'gate=[0x{func_addr:x},0x{hi:x}) extent={extent:#x} bytes')
+		return func_addr, hi
 
 	@panda.cb_virt_mem_after_write(name='oob_write_watcher', enabled=False)
 	def oob_write_watcher(cpu, pc, addr, size, buf):
@@ -438,10 +524,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		instrumentation: those pcs live in other functions, answer False here,
 		and therefore cost nothing however many times they execute.
 
-		Deliberately does NOT test _oob['armed'].  The range is static (the
-		storing function's extent), so this is enabled once at repro execve and
-		left alone — nothing translation-affecting then has to happen on the
-		kernel path around the store.  While disarmed the probe is a no-op."""
+		Deliberately does NOT test _oob['armed'].  The range is set once at repro
+		execve and left alone — nothing translation-affecting then has to happen on
+		the kernel path around the store.  While disarmed the probe is a no-op."""
 		return _oob['lo'] <= pc < _oob['hi']
 
 	@panda.cb_after_insn_exec(name='oob_probe', enabled=False)
@@ -584,10 +669,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		# this recording desynchronises from its log (see the note at the top of
 		# the file).  Executing into that gains nothing and costs the result.
 		#
-		# Only 'tainted' ends the run.  An untainted or inconclusive hit must NOT,
-		# because a later hit may still be the tainted one — in the baseline run it
-		# is hit #2 that carries the labels.
-		if outcome == 'tainted' and stop_on_first_violation:
+		# Both conditions must hold before we stop:
+		#   1. outcome == 'tainted': the probe read taint on the destination bytes
+		#   2. oob_confirmed: kasan_report fired for this hit, meaning the write
+		#      was genuinely OOB (kasan_check_range fires on every write; only
+		#      failing checks call kasan_report)
+		# An untainted or unconfirmed hit must NOT stop — a later hit may be the
+		# real OOB one.
+		if outcome == 'tainted' and _oob['oob_confirmed'] and stop_on_first_violation:
 			print('[analysis1] OOB taint confirmed — ending analysis before the '
 				  'replay reaches its divergence point')
 			# Go inert from here.  end_analysis() only *queues* the stop
@@ -598,9 +687,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			# "INCONCLUSIVE / no write observed" for a store that did happen.
 			_oob['done'] = True
 			panda.end_analysis()
-		elif outcome == 'tainted':
+		elif outcome == 'tainted' and _oob['oob_confirmed']:
 			print(f'[analysis1] OOB taint confirmed at hit #{hit} — collecting '
 				  f'further violations (stop_on_first_violation=False)')
+		elif outcome == 'tainted':
+			print(f'[analysis1] tainted write at hit #{hit} but kasan_report not '
+				  f'observed — write was in-bounds, continuing')
 
 	def _arm_oob_probe(cpu, dst, size, func_addr, hit, entry):
 		"""Arm the destination-side probe for a flagged OOB write.
@@ -624,12 +716,17 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		# RR_DO_RECORD_OR_REPLAY divergence documented on on_ret below.
 		paddrs = v2p_range(cpu, dst, size)
 
+		armed_by  = process_name(panda, cpu)
+		func_sym  = func_map.get(func_addr, None)
+		func_name = func_sym.symbol if func_sym else hex(func_addr)
 		_oob.update({
 			'armed': True,
 			'dst': dst,
 			'size': size,
 			'paddrs': paddrs,
 			'func_addr': func_addr,
+			'func_name': func_name,
+			'armed_by': armed_by,
 			'store_seen': False,
 			'store_pc': None,
 			'store_val': None,
@@ -637,16 +734,17 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			'probe_fired': 0,
 			'hit': hit,
 			'entry': entry,
+			'oob_confirmed': False,
 		})
-		# Plain plist->enabled flip — the helper is already emitted in
-		# bitmap_ip_add's blocks (the gate has been on since execve), so this needs
-		# no flush and changes nothing about translation.
+		# Plain plist->enabled flip — the helper is already emitted in the storing
+		# function's blocks (the gate has been on since execve), so this needs no
+		# flush and changes nothing about translation.
 		panda.enable_callback('oob_probe')
-		print(f'[analysis1]   oob probe armed: dst=0x{dst:x} size={size} '
-			  f'gate=[0x{_oob["lo"]:x},0x{_oob["hi"]:x}) '
+		print(f'[analysis1]   oob probe armed: process={armed_by!r} func={func_name} '
+			  f'dst=0x{dst:x} size={size} gate=[0x{_oob["lo"]:x},0x{_oob["hi"]:x}) '
 			  f'(watcher stays off until the KASAN report is done)')
 
-	def _setup_oob_probe():
+	def _setup_oob_probe(func_addr, func_name):
 		"""One-time, translation-affecting setup for the OOB probe.
 
 		Done at repro execve, in user context, precisely so that none of it has to
@@ -661,37 +759,43 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		    helpers) but flipping it mid-replay would change helper selection for
 		    subsequently translated blocks
 		After this, arming and disarming a probe only flips plist->enabled bits."""
-		if bitmap_ip_add_addr is None:
-			print('[analysis1] OOB destination probe not set up: bitmap_ip_add not in symbol_map')
-			return
-		lo, hi = _function_extent(bitmap_ip_add_addr, bitmap_ip_add_addr)
+		if func_addr is None:
+			print(f'[analysis1] FATAL: OOB probe cannot be set up: {func_name} not in symbol_map')
+			return False
+		lo, hi = _function_extent(func_addr)
+		if _oob['lo'] != 0:
+			if _oob['lo'] == lo:
+				return True   # already set up for this same function — no-op
+			print(f'[analysis1] FATAL: OOB probe gate already set to [0x{_oob["lo"]:x},0x{_oob["hi"]:x}) '
+				  f'but {func_name} wants [0x{lo:x},0x{hi:x}) — two conflicting bugs in one replay?')
+			return False
 		_oob['lo'], _oob['hi'] = lo, hi
 		panda.enable_memcb()
 		# The GATE stays enabled for the rest of the replay so the probe helper is
-		# (re)emitted into bitmap_ip_add's blocks on every translation — including
-		# retranslations triggered by someone else, e.g. taint2's flush when
-		# taint_enable() switches to LLVM.  Disabling it would risk bitmap_ip_add
-		# being retranslated without instrumentation while we are not looking, and
-		# re-enabling would then need another flush.  Its cost is translate-time
-		# only: one Python call per instruction translated, bounded by the number
-		# of unique instructions, not by how often they execute.
+		# (re)emitted into the storing function's blocks on every translation —
+		# including retranslations triggered by someone else, e.g. taint2's flush
+		# when taint_enable() switches to LLVM.  Its cost is translate-time only:
+		# one Python call per instruction translated, bounded by the number of
+		# unique instructions, not by how often they execute.
 		panda.enable_callback('oob_probe_gate')
 		panda.flush_tb()
 		# The PROBE callback is left disabled and toggled per hit instead.  While
-		# disabled the C dispatcher skips it entirely, so bitmap_ip_add executions
-		# outside a probe window cost nothing at all — and enabling it is a plain
-		# plist->enabled flip needing no flush, because the helper is already in
-		# the generated code.
+		# disabled the C dispatcher skips it entirely, so executions of the storing
+		# function outside a probe window cost nothing at all — and enabling it is
+		# a plain plist->enabled flip needing no flush, because the helper is
+		# already in the generated code.
 		print(f'[analysis1] OOB destination probe set up: gate=[0x{lo:x},0x{hi:x}) '
-			  f'({hi - lo} bytes of bitmap_ip_add), flushed TB cache; '
+			  f'({hi - lo} bytes of {func_name}), flushed TB cache; '
 			  f'probe armed per hit')
+		return True
 			  
 	# Call targets on_call actually does something for.  Testing membership here is
 	# a set lookup with no guest reads, which is what lets the OSI-based process
 	# check in _in_repro() stay correct without running on every call instruction.
 	interesting_call_addrs = {a for a in (
-		asan_memcpy_addr, kasan_check_write_addr, kdo_store_cb_addr,
-		sink_addr, panic_addr, handle_mm_fault_addr,
+		asan_memcpy_addr, kasan_check_write_addr, kasan_check_range_addr,
+		kasan_report_addr, kdo_store_cb_addr, sink_addr, panic_addr,
+		handle_mm_fault_addr,
 	) if a is not None}
 
 	def on_ret(cpu, addr):
@@ -718,24 +822,23 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if _oob['done']:
 			return
 
-		# Address prefilter first — no guest reads — then the OSI process check.
-		# on_ret previously had no process filter at all, which is why it kept
-		# reporting "no pending entry": it fired for handle_mm_fault returns in
-		# other processes, where on_call had (correctly) recorded nothing.
-		if addr != handle_mm_fault_addr and not (
-				_oob['armed'] and addr == _oob['func_addr']):
-			return
-		if not _in_repro(cpu):
-			return
+		# Two independent paths — each with its own address and process filter.
 
-		# OOB probe terminal condition: the flagged function has returned.  If no
-		# write to dst was ever observed then the store did not execute — a
-		# distinct outcome from "the store executed and carried no taint".
-		# Safe here despite the warning above: _finish_oob only reads shadow
-		# state and flips callback flags, it touches no guest memory.
+		# Path 1: OOB probe terminal condition.
+		# The gated function has returned.  Only finish if the returning process
+		# is the exact same process that armed the probe — keyed by name, recorded
+		# at arm time.  This prevents any other process returning from a function
+		# at the same address (e.g. the repro calling memcpy while the kworker
+		# probe is live) from falsely disarming it.
 		if _oob['armed'] and addr == _oob['func_addr']:
-			_finish_oob('flagged function returned')
+			pname = process_name(panda, cpu)
+			if pname == _oob['armed_by']:
+				_finish_oob('flagged function returned')
+			else:
+				pass  # different process returning from same addr — ignore
+			return
 
+		# Path 2: handle_mm_fault return — repro process only.
 		if handle_mm_fault_addr is None or addr != handle_mm_fault_addr:
 			return
 
@@ -756,7 +859,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		zero_page_pending.append(page_base)
 
 	def on_call(cpu, addr):
-		global memcpy_hit_ctr, kasan_check_write_hit_ctr, analysis, kdo_label_nr
+		global memcpy_hit_ctr, kasan_check_write_hit_ctr, kasan_check_range_hit_ctr, analysis, kdo_label_nr
 		nonlocal refresh_pending
 
 		# Answer already obtained and the stop queued — see _oob['done'].
@@ -781,9 +884,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				refresh_pending or zero_page_pending):
 			return
 
-		# Only care about calls from the reproducer process.
-		if not _in_repro(cpu):
-			return
+		# Calls that must come from the reproducer process.  kasan_check_range and
+		# kasan_report are excluded — both fire from a kworker, not from the repro
+		# — and get their own per-handler process checks further down.
+		# The drain paths (refresh_pending / zero_page_pending) are repro-only.
+		if addr not in (kasan_check_range_addr, kasan_report_addr):
+			if not _in_repro(cpu):
+				return
 
 		# Drain a deferred pm.refresh() requested by on_sys_mmap_return.
 		# on_call fires from AFTER_BLOCK_EXEC — the first user-space TB after the
@@ -1035,9 +1142,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				}
 				analysis.setdefault('bitmap_ip_add_kasan_check_writes', []).append(entry)
 
-				# Arm the destination-side probe to confirm taint on the bytes
-				# actually written out of bounds.  The gate is already live from
-				# execve; this only records dst/size and resets the per-hit state.
+				if not _setup_oob_probe(bitmap_ip_add_addr, 'bitmap_ip_add'):
+					return
 				if _oob['armed']:
 					print(f'[analysis1]   oob probe still armed from hit #{_oob["hit"]} — '
 						  f'closing it out before re-arming')
@@ -1045,6 +1151,84 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				_arm_oob_probe(cpu, ptr, size, bitmap_ip_add_addr,
 							   kasan_check_write_hit_ctr, entry)
 				return
+
+		if kasan_check_range_addr is not None and addr == kasan_check_range_addr:
+			# bool kasan_check_range(const void *addr, size_t size, bool write,
+			#                        unsigned long ret_ip)
+			# x86_64 SysV ABI: arg0=rdi (addr), arg1=rsi (size),
+			#                   arg2=rdx (write), arg3=rcx (ret_ip)
+			#
+			# This hook fires from a kworker, not the repro process, so the
+			# blanket _in_repro guard above was skipped.  Apply a dedicated
+			# kworker check here.
+			if not _in_kworker(cpu):
+				return
+
+			kasan_check_range_hit_ctr += 1
+			is_write = panda.arch.get_arg(cpu, 2)
+			if not is_write:
+				return
+
+			# Exact call-stack filter matching the KASAN report:
+			#   kasan_check_range  <- we are here
+			#   memcpy
+			#   _copy_to_iter+0x997   <- callers[1] (return addr after call memcpy)
+			#   ...
+			#   p9_read_work+0x1f0    <- somewhere deeper in callers
+			# callers[0] is the return address inside memcpy after its call to
+			# kasan_check_range; callers[1] is _copy_to_iter+0x997 (the return
+			# address in _copy_to_iter after its `call memcpy`).
+			is_target = (
+				p9_read_work_filter_addr is not None and
+				p9_read_work_filter_addr in callers and
+				copy_to_iter_kasan_range_retaddr is not None and
+				len(callers) > 1 and callers[1] == copy_to_iter_kasan_range_retaddr
+			)
+			if not is_target:
+				return
+
+			ptr  = panda.arch.get_arg(cpu, 0)
+			size = panda.arch.get_arg(cpu, 1)
+
+			print(f"[analysis1] *** TARGET HIT #{len(analysis.get('p9_read_work_kasan_check_ranges', [])) + 1} at kasan_check_range call #{kasan_check_range_hit_ctr} ***")
+			print(f"[analysis1] kasan_check_range #{kasan_check_range_hit_ctr} in '{process_name(panda, cpu)}' caller={hex(immediate_caller) if immediate_caller else 'none'}")
+			log(f'kasan_check_range call #{kasan_check_range_hit_ctr}:')
+			log(f'  write target=0x{ptr:x} size={size} (store not yet executed)')
+			print(f'[analysis1]   write target=0x{ptr:x} size={size}')
+
+			entry = {
+				'hit': kasan_check_range_hit_ctr,
+				'backtrace': [hex(a) for a in callers],
+				'ptr': hex(ptr),
+				'size': size,
+			}
+			analysis.setdefault('p9_read_work_kasan_check_ranges', []).append(entry)
+
+			# Gate the probe on memcpy, not _copy_to_iter: the OOB store
+			# happens inside memcpy's body, so _copy_to_iter's PC range never
+			# contains the store instruction and the probe would never fire.
+			if not _setup_oob_probe(memcpy_addr, 'memcpy'):
+				return
+			if _oob['armed']:
+				print(f'[analysis1]   oob probe still armed from hit #{_oob["hit"]} — '
+					  f'closing it out before re-arming')
+				_finish_oob('superseded by a later kasan_check_range target hit')
+			_arm_oob_probe(cpu, ptr, size, memcpy_addr,
+						   kasan_check_range_hit_ctr, entry)
+			return
+
+		if kasan_report_addr is not None and addr == kasan_report_addr:
+			# kasan_report is only called by KASAN when a range check fails.
+			# No process filter needed — that's the only reason it's ever called.
+			# If our probe is currently armed, this confirms the write it's
+			# watching is genuinely OOB.  The probe will call _finish_oob when
+			# it reads the taint after the store; _finish_oob checks oob_confirmed
+			# before deciding to stop.
+			if _oob['armed']:
+				print(f'[analysis1] kasan_report fired — OOB confirmed for hit '
+				      f'#{_oob["hit"]} (dst=0x{_oob["dst"]:x})')
+				_oob['oob_confirmed'] = True
+			return
 
 		return
 
@@ -1063,9 +1247,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print(f"[analysis1] repro execve detected: {fname} — enabling on_call and on_ret hooks")
 		panda.ppp("callstack_instr", "on_call")(on_call)
 		panda.ppp("callstack_instr", "on_ret")(on_ret)
-		# Do the probe's translation-affecting setup here, in user context, so the
-		# kernel path around the OOB store needs none of it.
-		_setup_oob_probe()
+		# OOB probe gate is set up lazily on the first target hit in on_call,
+		# where we know exactly which storing function to instrument.
 		panda.disable_ppp("on_sys_execve_enter")
 
 	@panda.ppp("syscalls2", "on_sys_mmap_enter")
@@ -1125,7 +1308,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print(f'[analysis1] copy_to_urb target hits: {len(analysis.get("copy_to_urb_memcpy_calls", []))}')
 		print(f'[analysis1] total __kasan_check_write calls in repro: {kasan_check_write_hit_ctr}')
 		print(f'[analysis1] bitmap_ip_add target hits: {len(analysis.get("bitmap_ip_add_kasan_check_writes", []))}')
-		_hits = analysis.get('bitmap_ip_add_kasan_check_writes', [])
+		print(f'[analysis1] total kasan_check_range calls in repro: {kasan_check_range_hit_ctr}')
+		print(f'[analysis1] p9_read_work target hits: {len(analysis.get("p9_read_work_kasan_check_ranges", []))}')
+		_hits = (analysis.get('bitmap_ip_add_kasan_check_writes', []) +
+				 analysis.get('p9_read_work_kasan_check_ranges', []))
 		_oob_outcomes = [e.get('oob_dst', {}).get('outcome', 'probe-never-finished')
 						 for e in _hits]
 		print(f'[analysis1] OOB destination probe outcomes per hit: {_oob_outcomes}')

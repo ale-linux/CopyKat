@@ -2,13 +2,19 @@ ARG BASE_IMAGE="ubuntu:22.04"
 
 ARG TARGET_LIST="x86_64-softmmu,aarch64-softmmu"
 
+# syz-rrr: >= 1.8.75 is required for the syscalls2 NULL-guest-insn fix
+# (upstream f28de5217d), without which replaying a recording whose last two TB
+# bytes merely look like `syscall` segfaults in tcg_op_insert_after().
+ARG PANDA_VERSION="1.8.85"
+
 ### BASE IMAGE
 FROM $BASE_IMAGE as base
 ARG BASE_IMAGE
+ARG PANDA_VERSION
 
 # Download the Panda source code
 RUN apt-get -qq update && apt-get -qq install -y git
-RUN git clone --depth 1 --branch v1.8.8 https://github.com/panda-re/panda /panda/
+RUN git clone --depth 1 --branch v${PANDA_VERSION} https://github.com/panda-re/panda /panda/
 
 # syz-rrr: instead of copying we take it from the clone just above
 # Copy dependencies lists into container. We copy them all and then do a mv because
@@ -26,6 +32,11 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommend
 FROM base AS builder
 ARG BASE_IMAGE
 ARG TARGET_LIST
+ARG PANDA_VERSION
+
+# pypanda's version comes from setuptools_scm, which reads git tags — but we
+# delete /panda/.git before building, so pin the version explicitly instead.
+ENV PRETEND_VERSION=${PANDA_VERSION}
 
 RUN apt-get -qq update
 RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $(cat /tmp/build_dep.txt | grep -o '^[^#]*') && \
@@ -33,6 +44,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $(
     python3 -m pip install --upgrade --no-cache-dir pip && \
     python3 -m pip install --upgrade --no-cache-dir "cffi>1.14.3" && \
     python3 -m pip install --upgrade --no-cache-dir "capstone" && \
+    python3 -m pip install --upgrade --no-cache-dir setuptools_scm build && \
     curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
 
 # Then install capstone from source
@@ -63,7 +75,8 @@ RUN git -C /panda submodule update --init dtc && \
         --prefix=/usr/local \
         --disable-numa \
         --enable-llvm \
-        --extra-cflags="-Wno-error=deprecated-declarations" && \
+        --extra-cflags="-Wno-error" \
+        --extra-cxxflags="-Wno-error" && \
     rm -rf /panda/.git && \
 	rm -rf /panda/panda/plugins/snake_hook/ && \
 	sed -i 's/"snake_hook",//' /panda/panda/plugins/Cargo.toml && \
@@ -74,7 +87,8 @@ RUN make -C /panda/build -j "$(nproc)"
 #### Develop setup: panda built + pypanda installed (in develop mode) - Stage 3
 FROM builder as developer
 RUN cd /panda/panda/python/core && \
-    python3 setup.py develop && \
+    python3 create_panda_datatypes.py && \
+    python3 -m pip install -e . && \
     ldconfig && \
     update-alternatives --install /usr/bin/python python /usr/bin/python3 10 && \
     cd /panda && \
@@ -86,14 +100,18 @@ WORKDIR /panda/
 #### Install PANDA + pypanda from builder - Stage 4
 FROM builder as installer
 RUN  make -C /panda/build install && \
-    rm -r /usr/local/lib/panda/*/cosi \
+    rm -rf /usr/local/lib/panda/*/cosi \
         /usr/local/lib/panda/*/cosi_strace \
         /usr/local/lib/panda/*/gdb \
         /usr/local/lib/panda/*/rust_skeleton
 
-# Install pypanda
+# Install pypanda.  setup.py no longer generates the autogen/ datatypes or
+# derives a version on its own (upstream 48bf566b9f), so do both explicitly and
+# install the wheel that `build` produces.
 RUN cd /panda/panda/python/core && \
-    python3 setup.py install
+    python3 create_panda_datatypes.py --install && \
+    python3 -m build --wheel . && \
+    python3 -m pip install dist/*.whl
 RUN python3 -m pip install --ignore-install pycparser && python3 -m pip install --force-reinstall --no-binary :all: cffi
 
 # BUG: PANDA sometimes fails to generate all the necessary files for PyPANDA. This is a temporary fix to detect and fail when this occurs

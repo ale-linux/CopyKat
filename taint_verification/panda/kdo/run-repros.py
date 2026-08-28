@@ -130,6 +130,8 @@ def main() -> None:
         help='Host directory to share with the guest via virtio-9p (mounted at /mnt/)')
     opts.add_argument('--skip-rsync', action='store_true', default=False,
         help='Skip the rsync step before recording (repros must already be present in the snapshot)')
+    opts.add_argument('--repro', metavar='REPRO_ID', default=None,
+        help='Record only this single repro ID instead of all')
     args = opts.parse_args()
 
     kdo.update_config(share_path=str(args.share_path))
@@ -175,6 +177,11 @@ def main() -> None:
     # Main recording loop.
     # -------------------------------------------------------------------------
     repros = [{"id": report['id'], "kernel": report['kernel']} for report in reports_json]
+
+    if args.repro is not None:
+        repros = [r for r in repros if r['id'] == args.repro]
+        if not repros:
+            sys.exit(f"[run-repros] ERROR: repro {args.repro!r} not found in reports file")
 
     record_results = []
 
