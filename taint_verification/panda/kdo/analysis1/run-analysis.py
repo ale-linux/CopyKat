@@ -123,8 +123,10 @@ def main() -> None:
     opts.add_argument('--rerun', action='store_true',
             help='only run entries whose analysis1.json is missing')
     opts.add_argument('--share-path', type=str, required=False,
-            help='host share directory containing <repro_id>/repro binaries '
-                 '(for symbol parsing)')
+            help='host share directory containing <repro_id>/repro binaries.  '
+                 'Used for symbol parsing AND to give the replayed machine the '
+                 'same virtio-9p device the recording was made with — pass the '
+                 'same value run-repros.py was given')
     opts.add_argument('--multi-shot', action='store_true',
             help='collect every OOB violation instead of stopping at the first '
                  'confirmed one; analysis1.json is rewritten after each hit')
@@ -136,7 +138,12 @@ def main() -> None:
     if multi_shot:
         print('[run-analysis] --multi-shot: collecting all violations')
 
-    analysis1.update_config()
+    # Recording ran with kdo.update_config(share_path), which appends
+    # `-fsdev local,... -device virtio-9p-pci,...` to the QEMU machine args.
+    # Replaying without those gives the replayed machine a different PCI device
+    # set than the recorded one, which is a good way to make a replay diverge —
+    # so pass the same share path through when we have it.
+    analysis1.update_config(share_path=args.share_path)
 
     os.chdir(OUT_BASE)
     assert os.path.realpath(os.getcwd()) == os.path.realpath(OUT_BASE)
