@@ -123,6 +123,88 @@ returned*, so "we are back in the caller of the KASAN helper, with the report
 behind us" is the single event on_ret(hook_addr) — the shadow stack's depth-zero
 moment, obtained exactly and for free.
 
+GETTING THE STORE TO EXECUTE
+----------------------------
+The destination probe only works if the OOB store actually runs, and for the
+mem*() family on a stock kernel it usually does not.  kasan_check_range() is
+
+    bool kasan_check_range(unsigned long addr, size_t size, bool write,
+                           unsigned long ret_ip)
+    {
+            ...
+            return !kasan_report(addr, size, write, ret_ip);   /* mm/kasan/generic.c */
+    }
+
+and kasan_report() returns true only when it actually printed something:
+
+    if (unlikely(report_suppressed_sw()) || unlikely(!report_enabled())) {
+            ret = false;                                      /* mm/kasan/report.c */
+            goto out;
+    }
+
+    static bool report_enabled(void)
+    {
+            if (current->kasan_depth)                    return false;
+            if (test_bit(KASAN_BIT_MULTI_SHOT, &kasan_flags)) return true;
+            return !test_and_set_bit(KASAN_BIT_REPORTED, &kasan_flags);
+    }
+
+Compose that with KASAN's memcpy()/memmove()/memset() wrappers, which are the
+only kasan_check_range() callers that ACT on the result (compiler-generated
+__asan_store*() and instrument_write() both discard it — which is why the
+__kasan_check_write case works), and you get a config where you can have the
+report or the store, never both:
+
+  * no kasan_multi_shot (what rrr boots with today — rrr/__init__.py:43 rebinds
+    extra_qemu_kernel_args and the winning binding drops it): the FIRST OOB of
+    the boot prints its report, kasan_report() returns true, the check returns
+    false, and the wrapper returns NULL without copying.  Every LATER OOB is
+    suppressed, kasan_report() returns false, the check "passes", and the copy
+    does happen — but no report is printed for it.
+  * with kasan_multi_shot: every report prints, so every mem*() check vetoes its
+    copy and the store NEVER executes.  Strictly worse here.
+
+There is no boot parameter that gives both.  kasan.fault=report|panic only
+reaches end_report(); it does not change the return value.  So for the occurrence
+whose report is PRINTED, the store cannot be made to happen by configuration —
+memcpy() takes that decision itself.  What is left:
+
+  1. A LATER occurrence of the same OOB in the same boot already stores, for free.
+     One-shot suppression makes report_enabled() false from the second report
+     onwards, so kasan_report() returns false, the check "passes", and __memcpy()
+     runs.  Confirmation still works, because this module hooks the CALL to
+     kasan_report() and that call happens either way — the function just
+     early-returns.  So a second occurrence yields a destination window that is
+     both confirmed AND has a real store, with no changes anywhere.
+     Requires (a) the reproducer to re-trigger the bug and (b) the recording to
+     extend past the first report — kdo stops draining serial output 30 s after
+     the sentinel (kdo/__init__.py: IDLE_TIMEOUT), so lengthening that is the
+     cheapest thing to try.  Check analysis1.json for a second hit on the target
+     with confirmed_by_kasan_report=true before doing anything else.
+     Do NOT add kasan_multi_shot if you are relying on this: it keeps every report
+     enabled and therefore vetoes every copy.
+  2. Read the SOURCE instead, and never depend on the store.  Where the report's
+     faulting frame is a call to memcpy(), hooking memcpy itself hands you
+     (dest, src, len) in rdi/rsi/rdx, so the taint on the bytes about to go out
+     of bounds is readable before anything stores.  Works on the recordings you
+     already have; this is the p9_read_work_src catalogue entry.  For a straight
+     memcpy this is not a proxy for the destination reading but the same answer:
+     taint2 copies labels byte-for-byte through the store, so src[0..n) and the
+     post-store dst[0..n) carry identical labels.  It stops being equivalent only
+     where the store is not a verbatim copy (memset, computed values, partial
+     writes).
+  3. Patch the wrappers so they stop vetoing (mm/kasan/shadow.c) — call both
+     kasan_check_range()s for their side effects and __memcpy() unconditionally,
+     the way the kernel did before the check results were made to veto the copy.
+     The report still prints, so kdo's serial sentinel still fires, AND the store
+     executes.  Then kasan_multi_shot becomes useful rather than harmful.  Needs a
+     rebuild and a re-record.  See
+     kernel-patches/0001-kasan-do-not-veto-mem-on-a-failed-range-check.patch.
+  4. Deliberately burn KASAN_BIT_REPORTED during boot, before the snapshot, so
+     every recording starts suppressed and every mem*() copy proceeds.  Rejected:
+     the target report is then never printed either, so kdo's expect_prompt never
+     matches and the recording is scored NO_CRASH.
+
 RECORD/REPLAY HAZARDS
 ---------------------
   * Guest *virtual* reads (OSI, the VMA walk, virt_to_phys) run
@@ -294,39 +376,43 @@ BUG_CATALOGUE = (
 		'source':   False,
 		'dest':     True,
 	},
-	# The entry below is the more robust way to answer the same question for the
-	# p9_read_work bug, and is left disabled because it needs a decision first.
-	#
-	# KASAN's memcpy() wrapper is
-	#     if (!kasan_check_range(dest, len, true, _RET_IP_) ||
-	#         !kasan_check_range(src,  len, false, _RET_IP_))
+	# Same bug, second route — and on a stock kernel the ONLY route that yields a
+	# reading.  KASAN's memcpy() wrapper is
+	#     if (!kasan_check_range(src,  len, false, _RET_IP_) ||
+	#         !kasan_check_range(dest, len, true,  _RET_IP_))
 	#             return NULL;
 	#     return __memcpy(dest, src, len);
-	# so on a FAILING check it returns without copying: the OOB store never
-	# executes and the destination probe can only ever report
-	# 'store_never_executed'.  (Whether the check fails is itself boot-order
-	# dependent — see the note printed for that outcome.)  Hooking memcpy's own
-	# entry instead gives (dest, src, len) straight out of rdi/rsi/rdx, which
-	# turns this bug into the easy case 1: read the source taint before anything
-	# stores.  The pedigree is also simpler and more selective than the one above,
-	# because _copy_to_iter+0x997 is the immediate caller rather than callers[1].
+	# and kasan_check_range() returns `!kasan_report(...)`, so a check whose report
+	# is actually PRINTED vetoes the copy: the OOB store never executes and the
+	# destination probe above can only report 'store_never_executed'.  See
+	# "GETTING THE STORE TO EXECUTE" in the module docstring.
 	#
-	# Enabling it as-is is NOT correct yet: memcpy calls kasan_check_range, so
-	# both entries would match on the same call and the second hit would supersede
-	# the first window.  Either drop the kasan_check_range entry above, or teach
-	# the machinery to hold a source-only window and a destination window at the
-	# same time.
+	# Hooking memcpy's own entry sidesteps all of that: rdi/rsi/rdx hold
+	# (dest, src, len), so the taint on the bytes that are ABOUT to go out of
+	# bounds can be read before anything stores — exactly case 1.  The pedigree is
+	# also cheaper and more selective than the one above, because
+	# _copy_to_iter+0x997 (the return address the report prints) is the immediate
+	# caller rather than callers[1].
 	#
-	# {
-	# 	'id':       'p9_read_work_src',
-	# 	'hook':     'memcpy',
-	# 	'args':     'memcpy',
-	# 	'pedigree': (('frame', 0, ('_copy_to_iter',), 0x997),),
-	# 	'store_fn': 'memcpy',
-	# 	'ctx':      'kworker',
-	# 	'source':   True,
-	# 	'dest':     False,
-	# },
+	# Both entries are live on purpose: memcpy calls kasan_check_range, so both
+	# windows are open across the same access and kasan_report confirms both.  The
+	# source window produces the verdict; the destination window records whether
+	# the store executed at all.
+	{
+		'id':       'p9_read_work_src',
+		'hook':     'memcpy',
+		'args':     'memcpy',
+		# _copy_to_iter+0x997 alone would match every pipe/socket read that goes
+		# through that call site, and each match costs an OSI walk plus a
+		# source-buffer taint read.  Keep p9_read_work+0x1f0 in the pedigree to
+		# prune those, exactly as the kasan_check_range entry does.
+		'pedigree': (('frame', 0, ('_copy_to_iter',), 0x997),
+					 ('anywhere', ('p9_read_work',), 0x1f0)),
+		'store_fn': 'memcpy',
+		'ctx':      'kworker',
+		'source':   True,
+		'dest':     False,
+	},
 )
 
 # Depth requested from callstack_instr for pedigree matching and for the
@@ -573,7 +659,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# while; and panda.ending makes pandare's enable_callback() a silent no-op
 	# (panda.py:2908-2916), so anything armed after this point could never fire
 	# and would report a bogus "no store observed" for a store that did happen.
-	state = {'stopped': False, 'window': None}
+	# 'windows' holds every window still open.  More than one can be open at a
+	# time because a hook may itself call another hook (memcpy -> kasan_check_range)
+	# and both describe the same access; kasan_report then confirms both.  Only one
+	# of them may be a destination window, though, since there is a single
+	# watcher/probe callback pair — 'dest_window' is that one.
+	state = {'stopped': False, 'windows': [], 'dest_window': None}
 
 	def log(s):
 		if enable_logging:
@@ -764,7 +855,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		taint2's taint_copy for this very store has not run yet, so the shadow
 		still holds the pre-store state.  It reads no guest memory either — the
 		written value comes from `buf`."""
-		w = state['window']
+		w = state['dest_window']
 		if w is None or not w.watching:
 			return
 		if addr + size <= w.dst or addr >= w.dst + w.watch_size:
@@ -783,7 +874,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 		NB `pc` is the NEXT instruction's address: translate.c advances pc_ptr via
 		disas_insn() before emitting this helper (target/i386/translate.c:8551)."""
-		w = state['window']
+		w = state['dest_window']
 		if w is None or not w.store_seen or w.taint_read:
 			return 0
 		w.read_dest_taint(cpu, pc)
@@ -1098,8 +1189,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			# written once the replay hits its desync point.
 			_write_analysis()
 
-			if state['window'] is self:
-				state['window'] = None
+			if self in state['windows']:
+				state['windows'].remove(self)
+			if state['dest_window'] is self:
+				state['dest_window'] = None
 
 			if outcome == 'tainted' and stop_on_first_violation:
 				print('[analysis1] OOB taint confirmed — ending the analysis before '
@@ -1136,17 +1229,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					  f'0x{self.dst:x} was ever observed, so this is NOT a taint '
 					  f'negative [{result["reason"]}] ***')
 				print('[analysis1]   Expected when the caller ACTS on the check\'s '
-					  'return value.  KASAN\'s memcpy()/memmove()/memset() wrappers '
-					  'do exactly that: `if (!kasan_check_range(...)) return NULL;` '
-					  '— so on a failing check the copy is skipped and there is no '
-					  'store to observe.  Note this is also boot-order dependent: '
-					  'without `kasan_multi_shot` on the kernel cmdline (rrr/'
-					  '__init__.py:43 does not pass it), report_enabled() is false '
-					  'after the first report of the boot, kasan_report() then '
-					  'returns false, the check "passes", and the copy DOES happen.  '
-					  'The robust route for such a bug is to hook the wrapper '
-					  'itself and read its source buffer — see the commented '
-					  'p9_read_work_src entry in BUG_CATALOGUE.')
+					  'return value.  KASAN\'s mem*() wrappers do: '
+					  '`if (!kasan_check_range(...)) return NULL;`, and '
+					  'kasan_check_range() returns `!kasan_report(...)` — so a check '
+					  'whose report was PRINTED vetoes the copy and there is no '
+					  'store to observe.  Not a taint negative.  See "GETTING THE '
+					  'STORE TO EXECUTE" at the top of this file: either patch the '
+					  'wrappers and re-record, or rely on a source-reading target '
+					  '(here: p9_read_work_src) which needs no store at all.')
 			elif outcome == 'store_not_read':
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): a store landed at '
 					  f'pc={result["last_store_pc"]} but the probe never read the '
@@ -1242,14 +1332,27 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			analysis.setdefault('target_hits', {}) \
 					.setdefault(target['id'], []).append(entry)
 
-			prev = state['window']
-			if prev is not None and not prev.closed:
-				print(f'[analysis1]   window #{prev.hit} still open — closing it '
-					  f'before opening #{hit}')
-				prev.close('superseded by a later target hit')
+			# Close what this hit supersedes: any open window for the SAME target
+			# (that is what makes the reported reading the LAST one before
+			# kasan_report), and — if this one needs the store watcher — any other
+			# open destination window, since there is only one watcher/probe pair.
+			for prev in list(state['windows']):
+				if prev.closed:
+					continue
+				if prev.target['id'] == target['id']:
+					print(f'[analysis1]   window #{prev.hit} ({prev.target["id"]}) '
+						  f'still open — closing it before opening #{hit}')
+					prev.close('superseded by a later hit on the same target')
+				elif target['dest'] and prev.wants_dest:
+					print(f'[analysis1]   destination window #{prev.hit} '
+						  f'({prev.target["id"]}) still open — only one store '
+						  f'watcher exists, closing it before opening #{hit}')
+					prev.close('superseded by another target\'s destination probe')
 
 			w = OobWindow(cpu, target, hit, entry)
-			state['window'] = w
+			state['windows'].append(w)
+			if w.wants_dest:
+				state['dest_window'] = w
 			print(f"[analysis1] *** TARGET HIT: {target['id']} #{hit} at "
 				  f"{target['hook']} (task={w.armed_by!r}) ***")
 			print(f'[analysis1]   dst=0x{dst:x} size={size}'
@@ -1257,29 +1360,33 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				  + ' (store not yet executed)')
 			log(f"{target['id']} hit #{hit}: dst=0x{dst:x} size={size}")
 			w.capture(cpu, dst, size, src)
-			if w.closed:
-				state['window'] = None
 			return
 
 	def _on_kasan_report(cpu):
 		"""KASAN only calls kasan_report() when a range check has failed, so this
 		is the unambiguous "the access is out of bounds" signal.
 
-		It is only allowed to confirm the window that is currently open, and only
-		if it fires in the same task: a report raised by something else while our
-		window happens to be open must not confirm our (possibly in-bounds) write.
+		It confirms every window that is open in the SAME task — which is how a
+		hook nested inside another hook (memcpy -> kasan_check_range) gets both of
+		its windows confirmed for the one access.  A report raised by anything else
+		while our windows happen to be open must not confirm them, hence the task
+		check.
 		"""
 		ctr['kasan_report'] += 1
-		w = state['window']
-		if w is None or w.closed:
+		if not state['windows']:
 			return
-		if not w.same_ctx(cpu):
-			print(f'[analysis1] kasan_report in a different task than window '
-				  f'#{w.hit} ({w.armed_by!r}) — not confirming')
-			return
-		w.note_report()
-		if w.closed:
-			state['window'] = None
+		# process_name() is one OSI walk; kasan_report is rare, and all open
+		# windows are compared against the same answer.
+		pname = process_name(panda, cpu)
+		for w in list(state['windows']):
+			if w.closed:
+				continue
+			if w.cpu_index != cpu.cpu_index or pname != w.armed_by:
+				print(f'[analysis1] kasan_report in task {pname!r}, not the '
+					  f'{w.armed_by!r} that opened window #{w.hit} '
+					  f'({w.target["id"]}) — not confirming')
+				continue
+			w.note_report()
 
 	# ------------------------------------------------------------------
 	# callstack_instr hooks
@@ -1297,8 +1404,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			return
 
 		# --- window transitions ---
-		w = state['window']
-		if w is not None and not w.closed:
+		# list() because finalise() removes from state['windows'].
+		for w in list(state['windows']):
+			if w.closed or (addr != w.hook_addr and addr != w.store_addr):
+				continue
 			# The hooked helper returned: report done, control back in the caller,
 			# store imminent.  Tested first because for a source-only target
 			# hook_addr == store_addr and wants_dest is False, in which case the
@@ -1309,7 +1418,6 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			elif addr == w.store_addr:
 				if w.same_ctx(cpu):
 					w.close(f'{w.target["store_fn"]} returned')
-					state['window'] = None
 
 		# --- demand-paging: remember the faulted page ---
 		#
@@ -1664,12 +1772,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print("[analysis1] caught exception during replay")
 		print(traceback.format_exc())
 	finally:
-		# A window still open at the end of the replay has to be closed, or its
+		# Any window still open at the end of the replay has to be closed, or its
 		# evidence is silently dropped.
-		w = state['window']
-		if w is not None and not w.closed:
-			w.close('replay ended with the window still open')
-			state['window'] = None
+		for w in list(state['windows']):
+			if not w.closed:
+				w.close('replay ended with the window still open')
 
 		outfile.close()
 		print('[analysis1] replay done!')
