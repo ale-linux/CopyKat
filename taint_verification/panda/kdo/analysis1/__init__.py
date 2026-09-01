@@ -18,17 +18,28 @@ the bytes it is about to write carry taint from the reproducer's own stores
 read the *source* buffer while we still have it, or wait for the store to land
 and read the *destination*.
 
-Three report shapes are handled, described declaratively in BUG_CATALOGUE:
+Two shapes are handled, described declaratively in BUG_CATALOGUE:
 
-  1. __asan_memcpy(dst, src, n)   — the helper is handed the source buffer, so
-                                    the taint can be read at once, before the
-                                    store.  `source: True`.
-  2. __kasan_check_write(ptr, n)  — destination and size only, no source.  We
-  3. kasan_check_range(ptr,n,w,ip)  have to watch for the store and read the
-                                    taint on the destination.  `dest: True`.
+  * `source: True` — the hooked function is handed the source buffer, so the
+    taint can be read straight away, before anything stores.  This is the
+    preferred shape and it is worth going out of the way to get it: pick a hook
+    whose arguments include the source, even if that is one frame further out
+    than the KASAN helper the report happens to name.  __asan_memcpy(dst,src,n)
+    and memcpy(dst,src,n) both qualify.
+  * `dest: True` — only a destination and a size are available
+    (__kasan_check_write(ptr,n), kasan_check_range(ptr,n,write,ip)).  We then have
+    to wait for the store to land and read the taint on the destination bytes.
+    That is a lot more machinery, and it fails outright when the caller acts on
+    the check's return value — see "GETTING THE STORE TO EXECUTE".
 
-Case 3 executes entirely inside a kernel worker thread, not the reproducer, so
-nothing here may assume the reproducer is `current`.
+Reading the source is only equivalent to reading the destination when the store
+is a verbatim copy, which is exactly the mem*() case: taint2 propagates labels
+byte-for-byte through the store, so src[0..n) carries the labels post-store
+dst[0..n) would.  For memset, computed values or partial writes it is not, and
+the destination probe is the only correct answer.
+
+Neither shape may assume the reproducer is `current`: the p9_read_work bug
+executes entirely inside a kernel worker thread.
 
 PRUNING
 -------
@@ -42,12 +53,27 @@ CONFIRMATION
 A matching call stack is necessary but not sufficient: the same call site is hit
 many times and only one of those calls is the out-of-bounds one.  kasan_report()
 is the discriminator — KASAN only calls it when a range check has actually
-failed.  So every matching hit opens a *window*, the window collects a taint
-reading, and the reading is only promoted to a violation if kasan_report() fired
-while that window was open.  Depending on the case the report arrives before the
-reading (cases 2/3: the report runs inside the helper, the store comes after) or
-after it (case 1: the reading is taken at helper entry, the report runs inside).
-Both orders are handled; see OobWindow.
+failed.  So every matching hit opens a *window*, and a reading is only promoted
+to a violation if kasan_report() fired while that window was open AND named the
+access the window captured (OobWindow.report_matches: the reported range must
+overlap the range we recorded).  That range test is what keeps a report raised for
+something else from confirming the window — including memcpy's other check, the
+read of src, whose range lies in a different object.  The report's is_write flag is
+recorded but not gated on; every catalogue entry is a write that fails on the
+destination, so it would add nothing the range test does not already give.
+
+The report's own (addr, size, is_write, ip) are recorded alongside the verdict, so
+"is this the hit the KASAN report is about?" is answered by the JSON rather than
+by eye.
+
+Either order works.  A destination window is confirmed before its reading exists
+(the report runs inside the check; the store comes later).  A source window is
+confirmed after its reading could have been taken — and in fact the source read is
+deferred until confirmation, since nothing between the hook's entry and its range
+check writes to the source buffer, and the many in-bounds hits then cost no taint
+scan at all.  Where hook and store_fn are the same function (memcpy) the window
+spans exactly one call, so the confirming report can only be the one that call
+raised: there is no cross-call staleness to reason about.
 
 WHERE TAINT CAN BE READ  (the reason for the three-callback dance)
 -----------------------------------------------------------------
@@ -183,16 +209,16 @@ memcpy() takes that decision itself.  What is left:
      with confirmed_by_kasan_report=true before doing anything else.
      Do NOT add kasan_multi_shot if you are relying on this: it keeps every report
      enabled and therefore vetoes every copy.
-  2. Read the SOURCE instead, and never depend on the store.  Where the report's
-     faulting frame is a call to memcpy(), hooking memcpy itself hands you
-     (dest, src, len) in rdi/rsi/rdx, so the taint on the bytes about to go out
-     of bounds is readable before anything stores.  Works on the recordings you
-     already have; this is the p9_read_work_src catalogue entry.  For a straight
-     memcpy this is not a proxy for the destination reading but the same answer:
-     taint2 copies labels byte-for-byte through the store, so src[0..n) and the
-     post-store dst[0..n) carry identical labels.  It stops being equivalent only
-     where the store is not a verbatim copy (memset, computed values, partial
-     writes).
+  2. Read the SOURCE instead, and never depend on the store.  THIS IS WHAT THE
+     p9_read_work ENTRY DOES, and it is the right default wherever the source is
+     reachable.  The report's faulting frame is a `call memcpy`, so hooking memcpy
+     itself hands you (dest, src, len) in rdi/rsi/rdx and the taint on the bytes
+     about to go out of bounds is readable before anything stores.  Works on the
+     recordings you already have, needs no kernel change, and for a verbatim copy
+     it is not a proxy for the destination reading but the same answer (see the
+     note under "Two shapes" above).  It stops being equivalent only where the
+     store is not a verbatim copy — memset, computed values, partial writes — and
+     there the destination probe is the only correct route.
   3. Patch the wrappers so they stop vetoing (mm/kasan/shadow.c) — call both
      kasan_check_range()s for their side effects and __memcpy() unconditionally,
      the way the kernel did before the check results were made to veto the copy.
@@ -359,53 +385,43 @@ BUG_CATALOGUE = (
 		'dest':     True,
 	},
 	{
+		# The report's faulting frame is `_copy_to_iter+0x997`, i.e. a `call
+		# memcpy`, so hook memcpy itself rather than the kasan_check_range it
+		# calls.  rdi/rsi/rdx then hold (dest, src, len) and the taint on the
+		# bytes about to go out of bounds is readable with no store required —
+		# which matters, because on a stock kernel that store never happens: the
+		# wrapper is
+		#     if (!kasan_check_range(src,  len, false, _RET_IP_) ||
+		#         !kasan_check_range(dest, len, true,  _RET_IP_))
+		#             return NULL;
+		#     return __memcpy(dest, src, len);
+		# and kasan_check_range() returns `!kasan_report(...)`, so a check whose
+		# report is PRINTED vetoes the copy.  See "GETTING THE STORE TO EXECUTE".
+		#
+		# This is sound for a memcpy specifically because taint2 copies labels
+		# byte-for-byte through the store, so src[0..len) carries exactly the
+		# labels post-store dest[0..len) would.  It is NOT a general substitute:
+		# for memset, computed values or partial writes the source is not the
+		# thing that lands.
+		#
+		# Window scoping falls out for free: hook == store_fn == memcpy, so the
+		# window is open for exactly the duration of one memcpy call.  The
+		# kasan_report that confirms it can therefore only be the one raised by
+		# that call's own range check — there is no cross-call staleness to worry
+		# about, which is stronger than "keep the most recent reading".
 		'id':       'p9_read_work',
-		'hook':     'kasan_check_range',
-		'args':     'ptr_size_write',
-		# kasan_check_range        <- we are here
-		#   memcpy                    callers[0] = retaddr inside memcpy
-		#   _copy_to_iter+0x997       callers[1]
-		#   ...
-		#   p9_read_work+0x1f0        somewhere deeper
-		'pedigree': (('frame', 1, ('_copy_to_iter',), 0x997),
-					 ('anywhere', ('p9_read_work',), 0x1f0)),
-		# The store is in memcpy's body (or whatever memcpy jumps to), not in
-		# _copy_to_iter, so the window must stay open until memcpy returns.
-		'store_fn': 'memcpy',
-		'ctx':      'kworker',
-		'source':   False,
-		'dest':     True,
-	},
-	# Same bug, second route — and on a stock kernel the ONLY route that yields a
-	# reading.  KASAN's memcpy() wrapper is
-	#     if (!kasan_check_range(src,  len, false, _RET_IP_) ||
-	#         !kasan_check_range(dest, len, true,  _RET_IP_))
-	#             return NULL;
-	#     return __memcpy(dest, src, len);
-	# and kasan_check_range() returns `!kasan_report(...)`, so a check whose report
-	# is actually PRINTED vetoes the copy: the OOB store never executes and the
-	# destination probe above can only report 'store_never_executed'.  See
-	# "GETTING THE STORE TO EXECUTE" in the module docstring.
-	#
-	# Hooking memcpy's own entry sidesteps all of that: rdi/rsi/rdx hold
-	# (dest, src, len), so the taint on the bytes that are ABOUT to go out of
-	# bounds can be read before anything stores — exactly case 1.  The pedigree is
-	# also cheaper and more selective than the one above, because
-	# _copy_to_iter+0x997 (the return address the report prints) is the immediate
-	# caller rather than callers[1].
-	#
-	# Both entries are live on purpose: memcpy calls kasan_check_range, so both
-	# windows are open across the same access and kasan_report confirms both.  The
-	# source window produces the verdict; the destination window records whether
-	# the store executed at all.
-	{
-		'id':       'p9_read_work_src',
 		'hook':     'memcpy',
 		'args':     'memcpy',
-		# _copy_to_iter+0x997 alone would match every pipe/socket read that goes
-		# through that call site, and each match costs an OSI walk plus a
-		# source-buffer taint read.  Keep p9_read_work+0x1f0 in the pedigree to
-		# prune those, exactly as the kasan_check_range entry does.
+		# memcpy is one of the hottest functions in the kernel and
+		# _copy_to_iter+0x997 alone would match every pipe/socket read through
+		# that call site, so keep p9_read_work+0x1f0 in the pedigree to prune.
+		# Frame layout at memcpy entry:
+		#   [0] _copy_to_iter+0x997     the return address the report prints
+		#   [1] copy_page_to_iter+...
+		#   [2] pipe_read+...
+		#   [3] __kernel_read+...
+		#   [4] kernel_read+...
+		#   [5] p9_read_work+0x1f0
 		'pedigree': (('frame', 0, ('_copy_to_iter',), 0x997),
 					 ('anywhere', ('p9_read_work',), 0x1f0)),
 		'store_fn': 'memcpy',
@@ -413,6 +429,28 @@ BUG_CATALOGUE = (
 		'source':   True,
 		'dest':     False,
 	},
+	# Retired: the same bug via the kasan_check_range inside memcpy, watching the
+	# destination for the store.  It cannot produce a reading on a stock kernel —
+	# the check it hooks is the very one whose failure makes memcpy return NULL —
+	# so it only ever reported 'store_never_executed' while costing a window, an
+	# OSI walk and a destination paddr resolution per matching p9 message.  Kept
+	# here because it DOES work on a kernel patched per kernel-patches/0001-*, or
+	# on any occurrence whose report is suppressed, where it corroborates the
+	# source reading against the bytes that actually landed.  Re-enable both
+	# together; the machinery supports concurrent windows and kasan_report
+	# confirms all of them.
+	#
+	# {
+	# 	'id':       'p9_read_work_dest',
+	# 	'hook':     'kasan_check_range',
+	# 	'args':     'ptr_size_write',
+	# 	'pedigree': (('frame', 1, ('_copy_to_iter',), 0x997),
+	# 				 ('anywhere', ('p9_read_work',), 0x1f0)),
+	# 	'store_fn': 'memcpy',
+	# 	'ctx':      'kworker',
+	# 	'source':   False,
+	# 	'dest':     True,
+	# },
 )
 
 # Depth requested from callstack_instr for pedigree matching and for the
@@ -427,11 +465,82 @@ MAX_TAINT_BYTES = 4096
 
 PAGE_SIZE = 0x1000
 
+# Debug: ALSO read the source taint at hook entry, not only when kasan_report
+# confirms the window.  Never authoritative — the deferred read stays the one that
+# produces the verdict — but useful for two things:
+#   * it shows the labels on hits that never get confirmed, which is how you tell
+#     "the source is never tainted" apart from "we never reached the OOB call";
+#   * _read_source_taint() diffs the two readings and complains if they differ,
+#     which is the empirical check on the assumption that makes deferring sound
+#     (nothing writes the source buffer between the hook's entry and its range
+#     check).  Leave it on until you trust that, then turn it off.  On a
+#     disagreement the DEFERRED read stays authoritative — it is the later of the
+#     two and therefore the closer approximation to what __memcpy will copy — and
+#     reading['disagrees_with_hook_entry'] records what moved.
+# The block also hexdumps the source bytes themselves, annotated with which of
+# them carry labels — the two questions "is the OOB data attacker-controlled" and
+# "is it the data I put there" are usually asked together, and the values answer
+# the second one directly.
+# Costs one taint scan plus one guest read per pedigree-matching hit, i.e. exactly
+# what deferring was meant to avoid, so turn it off for a long run or a hot
+# pedigree.
+DEBUG_EAGER_SOURCE_READ = True
+
+# How many source bytes the debug block dumps and stores in analysis1.json.  A
+# p9 message or a URB can be kilobytes; a hexdump of that per hit is unreadable
+# and the JSON grows by 2 hex chars per byte per hit.
+DEBUG_DUMP_MAX_BYTES = 128
+
 # Kernel text on x86_64 with nokaslr.  Used to disambiguate symbols that exist
 # in both vmlinux and the statically-linked reproducer ('memcpy' is the one that
 # bites: rrr's symbol_map is last-writer-wins, so the userspace entry clobbers
 # the kernel one).
 KERNEL_TEXT_MIN = 0xffffffff00000000
+
+
+def _read_guest_bytes(panda, cpu, base, length):
+	"""Best-effort guest read of [base, base+length).
+
+	One panda_virtual_memory_rw() per PAGE rather than one call for the whole
+	range, so a single unmapped page costs that page and not the entire dump.
+	Returns (data, missing) where data is `length` bytes with 0 substituted for
+	anything unreadable, and missing is the set of offsets that were substituted.
+	"""
+	data = bytearray(length)
+	missing = set()
+	off = 0
+	while off < length:
+		va = base + off
+		chunk = min(PAGE_SIZE - (va & (PAGE_SIZE - 1)), length - off)
+		try:
+			raw = panda.virtual_memory_read(cpu, va, chunk)
+			data[off:off + chunk] = bytes(raw)
+		except Exception:
+			missing.update(range(off, off + chunk))
+		off += chunk
+	return bytes(data), missing
+
+
+def _hexdump(data, tainted=frozenset(), missing=frozenset(), width=16):
+	"""Hexdump lines, with a mask row under any line that has labelled bytes.
+
+	Each byte occupies a fixed 3-character cell so the mask lines up under the
+	values: `TT` for a byte carrying taint labels, `--` for one that does not, and
+	`??` in the value row for a byte that could not be read out of the guest."""
+	out = []
+	for off in range(0, len(data), width):
+		chunk = data[off:off + width]
+		cells = ''.join('?? ' if (off + i) in missing else f'{b:02x} '
+						for i, b in enumerate(chunk))
+		asc = ''.join('?' if (off + i) in missing
+					  else (chr(b) if 32 <= b < 127 else '.')
+					  for i, b in enumerate(chunk))
+		out.append(f'{off:04x}  {cells:<{width * 3}} |{asc}|')
+		if any((off + i) in tainted for i in range(len(chunk))):
+			mask = ''.join('TT ' if (off + i) in tainted else '-- '
+						   for i in range(len(chunk)))
+			out.append(f'      {mask:<{width * 3}} (taint)')
+	return out
 
 
 def _load_kernelinfo(path):
@@ -932,7 +1041,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					 'watching', 'probing', 'store_seen', 'store_count',
 					 'first_store_pc', 'first_store_val', 'last_store_pc',
 					 'last_store_val', 'taint_read', 'reading', 'confirmed',
-					 'instr_at_open')
+					 'instr_at_open', 'report', 'report_exact', 'debug_reading')
 
 		def __init__(self, cpu, target, hit, entry):
 			self.target     = target
@@ -955,7 +1064,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			self.last_store_val = None
 			self.taint_read = False
 			self.reading    = None      # {'kind': 'source'|'dest', ...}
+			self.debug_reading = None   # DEBUG_EAGER_SOURCE_READ, off the verdict path
 			self.confirmed  = False
+			self.report     = None      # the kasan_report() call that confirmed us
+			self.report_exact = None    # did it name exactly the range we captured?
 			self.instr_at_open = panda.rr_get_guest_instr_count()
 
 		# -- identity -------------------------------------------------------
@@ -1010,19 +1122,54 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			self.entry['watch_size'] = self.watch_size
 
 			if self.target['source'] and src is not None:
-				tainted, meta = read_taint_range(cpu, src, size, 'src')
 				self.entry['src'] = hex(src)
-				self.reading = {'kind': 'source', 'base': hex(src),
-								'tainted_bytes': tainted, 'meta': meta}
-				if tainted:
-					print(f'[analysis1]   source taint: {len(tainted)}/'
-						  f'{meta["read"]} bytes at 0x{src:x} carry labels')
-				else:
-					print(f'[analysis1]   source taint: none on 0x{src:x}+'
-						  f'{meta["read"]}')
-				self._maybe_finalise()
-				if self.closed:
-					return
+				# The source taint is read LAZILY, when kasan_report confirms this
+				# window — not here.  Between hook entry and that report the only
+				# code that has run is kasan_check_range's shadow lookups, which
+				# write nothing, so the answer is identical; and the (many) hits
+				# that turn out to be in-bounds then cost no taint scan at all.
+				# That matters because a pedigree anchored on a hot function can
+				# match hundreds of times before the OOB one.
+				print(f'[analysis1]   source buffer 0x{src:x}+{size} recorded; '
+					  f'taint read deferred to kasan_report')
+				if DEBUG_EAGER_SOURCE_READ:
+					tainted, meta = read_taint_range(cpu, src, size, 'src@entry')
+					self.debug_reading = {
+						'kind': 'source@entry', 'base': hex(src),
+						'tainted_bytes': tainted, 'meta': meta,
+					}
+					if tainted:
+						offs = sorted(tainted)
+						print(f'[analysis1]   [debug] source taint AT HOOK ENTRY: '
+							  f'{len(tainted)}/{meta["read"]} byte(s) carry labels, '
+							  f'offsets={offs if len(offs) <= 24 else offs[:24] + ["..."]}')
+						for off in offs[:8]:
+							print(f'[analysis1]   [debug]   src@entry[{off}] '
+								  f'labels={tainted[off]["labels"]} '
+								  f'resolved={tainted[off]["resolved"]}')
+						if len(offs) > 8:
+							print(f'[analysis1]   [debug]   ... and '
+								  f'{len(offs) - 8} more tainted byte(s)')
+					else:
+						print(f'[analysis1]   [debug] source taint AT HOOK ENTRY: '
+							  f'none of {meta["read"]} byte(s) carry labels '
+							  f'(untranslatable={meta["untranslatable"]}, '
+							  f'taint_enabled={meta["taint_enabled"]})')
+
+					# ...and the bytes themselves.  Safe here: capture() runs from
+					# on_call, i.e. AFTER_BLOCK_EXEC, the same callback side that
+					# already does the VMA walk.  The copy has not run yet, so this
+					# is exactly what is about to be written out of bounds.
+					dump_len = min(meta['read'], DEBUG_DUMP_MAX_BYTES)
+					value, gaps = _read_guest_bytes(panda, cpu, src, dump_len)
+					self.debug_reading['value'] = value.hex()
+					self.debug_reading['value_unreadable_offsets'] = sorted(gaps)
+					print(f'[analysis1]   [debug] source bytes about to be written '
+						  f'(0x{src:x}, {dump_len} of {size})'
+						  + (f', {len(gaps)} unreadable' if gaps else '')
+						  + (' [truncated]' if dump_len < meta['read'] else '') + ':')
+					for line in _hexdump(value, set(tainted), gaps):
+						print(f'[analysis1]   [debug]   {line}')
 
 			if self.wants_dest and self.watch_size == 0:
 				# Nothing to watch and nothing to read: do not let this masquerade
@@ -1050,6 +1197,59 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			_set_callback('oob_write_watcher', True, self, 'watching')
 			print(f'[analysis1]   dest probe live: {self.target["hook"]} returned, '
 				  f'watching writes to 0x{self.dst:x}+{self.watch_size}')
+
+		@staticmethod
+		def _label_shape(reading):
+			"""offset -> sorted label list, for comparing two readings."""
+			return {off: sorted(info['labels'])
+					for off, info in reading['tainted_bytes'].items()}
+
+		def _read_source_taint(self, cpu):
+			"""Read taint on the source buffer.  Safe to defer to confirmation
+			time: nothing between the hook's entry and its range check writes to
+			src, and the copy itself has not run yet."""
+			tainted, meta = read_taint_range(cpu, self.src, self.req_size, 'src')
+			self.reading = {'kind': 'source', 'base': hex(self.src),
+							'tainted_bytes': tainted, 'meta': meta}
+			if tainted:
+				print(f'[analysis1]   source taint: {len(tainted)}/{meta["read"]} '
+					  f'bytes at 0x{self.src:x} carry labels')
+			else:
+				print(f'[analysis1]   source taint: none on 0x{self.src:x}+'
+					  f'{meta["read"]}')
+
+			# The whole point of the eager debug read: check that deferring did not
+			# change the answer.  If these ever disagree, something between the
+			# hook's entry and its range check DID touch the source buffer and the
+			# deferral is not sound for that hook — the entry reading is the one to
+			# trust, because it is the one taken before anything else ran.
+			if self.debug_reading is None:
+				return
+			at_entry = self._label_shape(self.debug_reading)
+			at_report = self._label_shape(self.reading)
+			if at_entry == at_report:
+				print(f'[analysis1]   [debug] deferred read agrees with the hook-entry '
+					  f'read ({len(at_report)} tainted byte(s)) — deferral sound here')
+				return
+			gained = sorted(set(at_report) - set(at_entry))
+			lost   = sorted(set(at_entry) - set(at_report))
+			changed = sorted(o for o in set(at_entry) & set(at_report)
+							 if at_entry[o] != at_report[o])
+			print(f'[analysis1]   [debug] *** WARNING: the deferred read DISAGREES '
+				  f'with the hook-entry read — the source buffer changed between '
+				  f'{self.target["hook"]} entry and kasan_report ***')
+			print(f'[analysis1]   [debug]   gained taint at offsets {gained}')
+			print(f'[analysis1]   [debug]   lost taint at offsets   {lost}')
+			print(f'[analysis1]   [debug]   different labels at     {changed}')
+			# The deferred read stays authoritative: the bytes that actually get
+			# copied are the ones present when __memcpy runs, which is LATER than
+			# either read, so the later of the two is the closer approximation.
+			# Both readings are in the JSON; this flag says they did not agree.
+			print(f'[analysis1]   [debug]   keeping the deferred reading (closer in '
+				  f'time to the copy); both are recorded in analysis1.json')
+			self.reading['disagrees_with_hook_entry'] = {
+				'gained': gained, 'lost': lost, 'changed': changed,
+			}
 
 		def note_store(self, pc, addr, size, val):
 			self.store_count += 1
@@ -1112,13 +1312,53 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			self.taint_read = False
 			_set_callback('oob_probe', False, self, 'probing')
 
-		def note_report(self):
-			"""kasan_report() ran while this window was open."""
+		def report_matches(self, report):
+			"""Is this kasan_report() about the access this window captured?
+
+			kasan_report() is handed the same (addr, size) that kasan_check_range()
+			got, so for an access flagged through our hook the reported range IS the
+			range we recorded.  Checked rather than assumed so that a report raised
+			anywhere else in this task, while our window happens to be open, cannot
+			confirm it.
+
+			That also covers memcpy's OTHER check -- the read of src -- for free: src
+			is a different object, so its range does not overlap dest's and the report
+			is rejected.  report['is_write'] is therefore recorded but NOT gated on;
+			every bug in BUG_CATALOGUE is an out-of-bounds write that fails on the
+			destination, so the flag would add nothing the range test does not already
+			give.
+
+			Overlap rather than equality, so a KASAN version that narrows the reported
+			range to the first bad byte still matches; exactness is recorded separately
+			and is what you diff against the report text."""
+			if self.dst is None:
+				return False, 'no destination captured for this window'
+			lo, hi = self.dst, self.dst + max(self.req_size, 1)
+			rlo, rhi = report['addr'], report['addr'] + max(report['size'], 1)
+			if rhi <= lo or rlo >= hi:
+				return False, (f'reported range 0x{rlo:x}+{report["size"]} does '
+							   f'not overlap the captured 0x{lo:x}+{self.req_size}')
+			return True, None
+
+		def note_report(self, cpu, report):
+			"""kasan_report() ran while this window was open, and named an access
+			this window is about."""
 			if self.confirmed or self.closed:
 				return
+			self.report = report
+			self.report_exact = (report['addr'] == self.dst
+								 and report['size'] == self.req_size)
 			self.confirmed = True
-			print(f'[analysis1] kasan_report fired inside window #{self.hit} '
-				  f'({self.target["id"]}) — the access really is out of bounds')
+			print(f'[analysis1] kasan_report confirms window #{self.hit} '
+				  f'({self.target["id"]}) — write of size {report["size"]} at '
+				  f'0x{report["addr"]:x}, ip=0x{report["ip"]:x}'
+				  + ('' if self.report_exact else
+					 f' (NB does not exactly match the captured '
+					 f'0x{self.dst:x}+{self.req_size})'))
+			# Source targets read here rather than at hook entry — see capture().
+			if (self.target['source'] and self.reading is None
+					and self.src is not None):
+				self._read_source_taint(cpu)
 			self._maybe_finalise()
 
 		def _maybe_finalise(self):
@@ -1144,10 +1384,15 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				if self.wants_dest:
 					return 'store_not_read'
 				return 'no_reading'
-			if not self.reading['meta']['taint_enabled']:
+			meta = self.reading['meta']
+			if not meta['taint_enabled']:
 				return 'taint_off'
 			if self.reading['tainted_bytes']:
 				return 'tainted'
+			if meta['read'] and meta['untranslatable'] == meta['read']:
+				# Every byte we tried to look at was unmapped.  Absence of labels
+				# there says nothing at all.
+				return 'unreadable'
 			return 'untainted'
 
 		def finalise(self, reason):
@@ -1173,7 +1418,31 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				'last_store_pc':   hex(self.last_store_pc) if self.last_store_pc is not None else None,
 				'last_store_val':  hex(self.last_store_val) if self.last_store_val is not None else None,
 				'guest_instrs': panda.rr_get_guest_instr_count() - self.instr_at_open,
+				# The confirming kasan_report()'s own arguments, so the analysis's
+				# idea of the access can be diffed against the report text without
+				# reading it by eye: 'write of size <size> at addr <addr>'.
+				'kasan_report': (None if self.report is None else {
+					'addr':     hex(self.report['addr']),
+					'size':     self.report['size'],
+					'is_write': self.report['is_write'],
+					'ip':       hex(self.report['ip']),
+					'exact_match': self.report_exact,
+				}),
 				'reading':  self.reading,
+				# DEBUG_EAGER_SOURCE_READ only.  Kept compact when it found nothing
+				# so that a run with many in-bounds hits does not bloat the JSON.
+				'source_reading_at_hook_entry': (
+					None if self.debug_reading is None else
+					self.debug_reading if self.debug_reading['tainted_bytes'] else
+					# The byte values are kept even in the compact form: "no labels
+					# here" is exactly the case where you want to see what the
+					# buffer actually held.
+					{'kind': 'source@entry', 'base': self.debug_reading['base'],
+					 'tainted_bytes': {}, 'meta': self.debug_reading['meta'],
+					 'value': self.debug_reading.get('value'),
+					 'value_unreadable_offsets':
+						 self.debug_reading.get('value_unreadable_offsets')}
+				),
 			}
 			# The hit entry keeps a one-line verdict; the full record lives in
 			# analysis['observations'] so the JSON does not carry it twice.
@@ -1241,6 +1510,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): a store landed at '
 					  f'pc={result["last_store_pc"]} but the probe never read the '
 					  f'shadow [{result["reason"]}] ***')
+			elif outcome == 'unreadable':
+				print(f'[analysis1] *** INCONCLUSIVE ({tag}): all '
+					  f'{read["meta"]["read"]} {read["kind"]} bytes at '
+					  f'{read["base"]} were untranslatable — no labels could be '
+					  f'read, so this is NOT a taint negative ***')
 			elif outcome == 'taint_off':
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): taint2 was not enabled '
 					  f'when the reading was taken ***')
@@ -1364,29 +1638,53 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 	def _on_kasan_report(cpu):
 		"""KASAN only calls kasan_report() when a range check has failed, so this
-		is the unambiguous "the access is out of bounds" signal.
+		is the "the access is out of bounds" signal.
 
-		It confirms every window that is open in the SAME task — which is how a
-		hook nested inside another hook (memcpy -> kasan_check_range) gets both of
-		its windows confirmed for the one access.  A report raised by anything else
-		while our windows happen to be open must not confirm them, hence the task
-		check.
+		Note it fires whether or not the report is actually PRINTED: suppression
+		(one-shot, or current->kasan_depth) happens inside kasan_report, after the
+		call.  That is deliberate — it is what lets a suppressed occurrence, whose
+		check therefore "passes" and whose copy therefore executes, still be
+		recognised as out of bounds.
+
+		It confirms every open window in the same task whose captured access the
+		report actually names; a hook nested inside another hook (memcpy ->
+		kasan_check_range) can legitimately have two windows open for one access.
 		"""
 		ctr['kasan_report'] += 1
 		if not state['windows']:
 			return
-		# process_name() is one OSI walk; kasan_report is rare, and all open
-		# windows are compared against the same answer.
+
+		# bool kasan_report(unsigned long addr, size_t size, bool is_write,
+		#                   unsigned long ip)
+		# x86_64 SysV: rdi, rsi, rdx, rcx.  is_write is a C bool, i.e. the low
+		# byte of rdx.
+		report = {
+			'addr':     panda.arch.get_arg(cpu, 0),
+			'size':     panda.arch.get_arg(cpu, 1),
+			'is_write': bool(panda.arch.get_arg(cpu, 2) & 0xff),
+			'ip':       panda.arch.get_arg(cpu, 3),
+		}
+		print(f'[analysis1] kasan_report: '
+			  f'{"write" if report["is_write"] else "read"} of size '
+			  f'{report["size"]} at 0x{report["addr"]:x} (ip=0x{report["ip"]:x})')
+
+		# process_name() is one OSI walk; kasan_report is rare, and every open
+		# window is compared against the same answer.
 		pname = process_name(panda, cpu)
 		for w in list(state['windows']):
 			if w.closed:
 				continue
 			if w.cpu_index != cpu.cpu_index or pname != w.armed_by:
-				print(f'[analysis1] kasan_report in task {pname!r}, not the '
-					  f'{w.armed_by!r} that opened window #{w.hit} '
-					  f'({w.target["id"]}) — not confirming')
+				print(f'[analysis1]   in task {pname!r}, not the {w.armed_by!r} '
+					  f'that opened window #{w.hit} ({w.target["id"]}) — '
+					  f'not confirming')
 				continue
-			w.note_report()
+			ok, why = w.report_matches(report)
+			if not ok:
+				print(f'[analysis1]   not about window #{w.hit} '
+					  f'({w.target["id"]}): {why} — not confirming')
+				continue
+			w.note_report(cpu, report)
 
 	# ------------------------------------------------------------------
 	# callstack_instr hooks
