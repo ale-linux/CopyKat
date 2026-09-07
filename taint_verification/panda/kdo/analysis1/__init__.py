@@ -18,7 +18,8 @@ the bytes it is about to write carry taint from the reproducer's own stores
 read the *source* buffer while we still have it, or wait for the store to land
 and read the *destination*.
 
-Two shapes are handled, described declaratively in BUG_CATALOGUE:
+Three shapes are handled, described declaratively in BUG_CATALOGUE.  The first two
+differ in what the hooked function's arguments give us:
 
   * `source: True` — the hooked function is handed the source buffer, so the
     taint can be read straight away, before anything stores.  This is the
@@ -41,6 +42,70 @@ the destination probe is the only correct answer.
 Neither shape may assume the reproducer is `current`: the p9_read_work bug
 executes entirely inside a kernel worker thread.
 
+THE THIRD SHAPE: THE REPORT CALL ITSELF IS THE HOOK  (`confirm: 'hook'`)
+------------------------------------------------------------------------
+Both shapes above assume there IS a KASAN helper between the faulting function and
+the report — something whose arguments describe the access.  With
+CONFIG_KASAN_INLINE there is not.  The shadow test is open-coded into the
+instrumented function and the only call left on the failure path is the report
+thunk, so the report reads:
+
+    kasan_report+0xca/0x100
+    fuse_dev_do_write+0x3088/0x30b0      <- Write of size 4 at ffff888012f726dc
+    fuse_dev_write+0x144/0x1e0
+
+No __asan_store4, no kasan_check_range, no __kasan_check_write frame to hook.  The
+access is described by the report call itself, so that call becomes the hook:
+`__asan_report_store4_noabort(void *addr)` gives the target in rdi and the width in
+its own name (hence `args: 'ptr'` + `access_size`); `kasan_report(addr, size,
+is_write, ip)` would give all three in registers.
+
+Such a hook is its OWN discriminator.  Everything under CONFIRMATION below exists
+because a KASAN helper is called for in-bounds accesses too and only kasan_report
+tells the two apart — but a report thunk is reached ONLY when a shadow check has
+already failed.  So `confirm: 'hook'` means "the pedigree match IS the
+confirmation": the window is confirmed at hook entry from the hook's own
+arguments, with no second event to wait for.
+
+Hook the THUNK, not kasan_report.  Hooking kasan_report directly is the obvious
+reading of that report and it would never fire, because
+
+    void __asan_report_store4_noabort(void *addr)
+    { kasan_report(addr, 4, true, _RET_IP_); }        /* mm/kasan/generic.c */
+
+discards the result, so the compiler emits `jmp kasan_report` rather than a call.
+Two independent signs of it: the report's own stack trace has NO
+__asan_report_store4_noabort frame between kasan_report and fuse_dev_do_write,
+which a real call would have left for the ORC unwinder to print; and
+callstack_instr only pushes a frame when a translation block ENDS IN A CALL
+(callstack_instr.cpp:449-462), so a tail jump into kasan_report produces no
+on_call(kasan_report) at all — the arrival that this module's confirmation path
+and `hook_targets` dispatch both key on.  Hooking the thunk is correct either way,
+since the compiler always reaches it with a real call, and it is the better
+pedigree anchor too: callers[0] is then exactly the `fuse_dev_do_write+0x3088` the
+report prints.  (`kasan_report` is still supported as a hook — on_call() falls
+through to the confirmation path when an entry claims it — and BUG_CATALOGUE keeps
+a commented-out entry for the kernel where the thunk is absent or not tail-called.)
+
+The rest of the machinery needs nothing new, which is worth spelling out because
+none of it is obvious:
+
+  * ARMING.  on_ret reports the function the CALL entered, i.e. function_stacks[i]
+    (callstack_instr.cpp:398), so the `ret` that physically sits inside
+    kasan_report fires on_ret(__asan_report_store4_noabort) — matching the hook
+    address, tail call or not.  The write watcher goes live there, exactly as it
+    does for __kasan_check_write.
+  * THE STORE EXECUTES on a stock kernel.  The thunk returns void and the
+    instrumented code acts on nothing, so there is no veto — the same reason the
+    bitmap_ip_add entry works unpatched, and the reason this shape needs neither
+    kernel-patches/0001-* nor kasan_multi_shot.  See "GETTING THE STORE TO
+    EXECUTE".
+  * THE STORE IS NOT AT THE RETURN ADDRESS.  With inline instrumentation the
+    report call lives in a cold block near the end of the function (0x3088 of
+    0x30b0) and jumps back to the hot path, so the store executes some distance
+    away.  The watcher is keyed on dst and the after_insn gate is unconditional,
+    which is precisely what makes that a non-issue — see "COST".
+
 PRUNING
 -------
 These helpers are called millions of times per second of guest time.  A hit only
@@ -50,6 +115,10 @@ comparisons before anything touches guest memory.
 
 CONFIRMATION
 ------------
+All of this is about a hook that is also called for in-bounds accesses, i.e.
+`confirm: 'kasan_report'`.  A hook that only exists on the failure path confirms
+itself and skips the whole dance — see "THE THIRD SHAPE" above.
+
 A matching call stack is necessary but not sufficient: the same call site is hit
 many times and only one of those calls is the out-of-bounds one.  kasan_report()
 is the discriminator — KASAN only calls it when a range check has actually
@@ -151,6 +220,12 @@ moment, obtained exactly and for free.
 
 GETTING THE STORE TO EXECUTE
 ----------------------------
+This whole section is about the mem*() family and nothing else.  Every OTHER
+destination target — compiler-generated __asan_store*()/__asan_report_store*(),
+instrument_write(), __kasan_check_write() — discards the check's result, so its
+store executes on a stock kernel with no patch and no boot parameter.  That covers
+the bitmap_ip_add and fuse_dev_do_write entries.
+
 The destination probe only works if the OOB store actually runs, and for the
 mem*() family on a stock kernel it usually does not.  kasan_check_range() is
 
@@ -340,6 +415,13 @@ def process_name(panda, cpu):
 #               'ptr_size'       (ptr, size)             rdi, rsi
 #               'ptr_size_write' (ptr, size, is_write)   rdi, rsi, rdx
 #               'memcpy'         (dst, src, size)        rdi, rsi, rdx
+#               'ptr'            (ptr)                   rdi     — width is not
+#                        an argument at all, it is in the hook's NAME
+#                        (__asan_report_store4_noabort), so `access_size` supplies
+#                        it.  The variable-width sibling
+#                        __asan_report_store_n_noabort(addr, size) is 'ptr_size'.
+#   access_size  the access width in bytes.  REQUIRED for args=='ptr', ignored
+#             otherwise.  Comes from the report's "Write of size N".
 #   pedigree  call-stack constraints, ALL of which must hold.  Checked with
 #             integer comparisons only, before any guest memory is touched:
 #               ('frame', n, (sym, ...), off)  callers[n] == sym+off
@@ -357,6 +439,16 @@ def process_name(panda, cpu):
 #             entry, before the store.  No store watching needed.
 #   dest      no source buffer: watch for the store into [ptr, ptr+size) and
 #             read the taint on those bytes afterwards.
+#   confirm   what promotes a pedigree-matching hit to a real out-of-bounds
+#             access:
+#               'kasan_report'  wait for a kasan_report() call in the same task
+#                        that names an overlapping range.  For a hook KASAN also
+#                        calls on in-bounds accesses, which is most of them.
+#               'hook'   the hook itself only exists on the failure path
+#                        (__asan_report_store*_noabort, kasan_report), so the
+#                        pedigree match IS the confirmation and the window is
+#                        confirmed at entry from the hook's own arguments.  See
+#                        "THE THIRD SHAPE" in the module docstring.
 #
 # `source` and `dest` are independent; a catalogue entry may set both.  Setting
 # `dest` on an entry whose store happens *inside* the hooked function (case 1)
@@ -373,6 +465,7 @@ BUG_CATALOGUE = (
 		'ctx':      'repro',
 		'source':   True,
 		'dest':     False,
+		'confirm':  'kasan_report',
 	},
 	{
 		'id':       'bitmap_ip_add',
@@ -383,6 +476,7 @@ BUG_CATALOGUE = (
 		'ctx':      'repro',
 		'source':   False,
 		'dest':     True,
+		'confirm':  'kasan_report',
 	},
 	{
 		# The report's faulting frame is `_copy_to_iter+0x997`, i.e. a `call
@@ -428,7 +522,64 @@ BUG_CATALOGUE = (
 		'ctx':      'kworker',
 		'source':   True,
 		'dest':     False,
+		'confirm':  'kasan_report',
 	},
+	{
+		# CONFIG_KASAN_INLINE: the shadow check is open-coded into
+		# fuse_dev_do_write and the only call left on the failure path is the
+		# report thunk, so the report has no KASAN-helper frame to hook —
+		#     kasan_report+0xca/0x100
+		#     fuse_dev_do_write+0x3088/0x30b0    Write of size 4 at ffff888012f726dc
+		#     fuse_dev_write+0x144/0x1e0
+		# The thunk IS the hook, and because it only exists on the failure path it
+		# confirms itself (confirm='hook').  See "THE THIRD SHAPE" in the module
+		# docstring for why this is the thunk rather than kasan_report — the thunk
+		# tail-jumps into kasan_report, so on_call(kasan_report) never fires — and
+		# for why the store executes here on a stock kernel while memcpy's does
+		# not.
+		#
+		# dest-only, and not because a source is merely inconvenient: the store is
+		# a computed 4-byte value with no source buffer anywhere.  This is exactly
+		# the case the note under "Two shapes" reserves for the destination probe.
+		'id':          'fuse_dev_do_write',
+		'hook':        '__asan_report_store4_noabort',
+		'args':        'ptr',
+		'access_size': 4,          # the '4' in the hook's name; "Write of size 4"
+		# callers[0] at thunk entry is the return address of the `call` the
+		# compiler emitted, which is precisely what the report prints.  Frame 1 is
+		# fuse_dev_write+0x144; not enforced, because one instruction in a cold
+		# report block is already unique and the thunk is ice cold — it is only
+		# ever called on a failed check, so there is no hot path to prune.
+		'pedigree':    (('frame', 0, ('fuse_dev_do_write',), 0x3088),),
+		'store_fn':    'fuse_dev_do_write',
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	# Fallback for the same bug, hooking kasan_report directly.  Usable only on a
+	# kernel where __asan_report_store4_noabort is absent (outline instrumentation)
+	# or where it reaches kasan_report by a real CALL rather than a tail jump.  On
+	# this one it tail-jumps, so on_call never sees kasan_report at all and this
+	# entry would resolve, report itself available, and silently never hit — which
+	# is exactly the failure mode to watch for.  Enable it INSTEAD of the
+	# entry above, not alongside: both are destination targets, there is a single
+	# watcher/probe pair, and the later window would close the earlier one as
+	# 'store_never_executed'.
+	#
+	# {
+	# 	'id':       'fuse_dev_do_write_report',
+	# 	'hook':     'kasan_report',
+	# 	'args':     'ptr_size_write',
+	# 	# 'anywhere' rather than 'frame': the frame index depends on whether the
+	# 	# thunk left a frame, which is the very thing in doubt here.
+	# 	'pedigree': (('anywhere', ('fuse_dev_do_write',), 0x3088),),
+	# 	'store_fn': 'fuse_dev_do_write',
+	# 	'ctx':      'repro',
+	# 	'source':   False,
+	# 	'dest':     True,
+	# 	'confirm':  'hook',
+	# },
 	# Retired: the same bug via the kasan_check_range inside memcpy, watching the
 	# destination for the store.  It cannot produce a reading on a stock kernel —
 	# the check it hooks is the very one whose failure makes memcpy return NULL —
@@ -450,6 +601,7 @@ BUG_CATALOGUE = (
 	# 	'ctx':      'kworker',
 	# 	'source':   False,
 	# 	'dest':     True,
+	# 	'confirm':  'kasan_report',
 	# },
 )
 
@@ -673,6 +825,14 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if store_addr is None:
 			return None, f"store_fn {t['store_fn']} not found"
 
+		# Catalogue self-consistency.  Reported the same way as a missing symbol so
+		# that a malformed entry disables its own target and says why, rather than
+		# raising out of a callback in the middle of a replay.
+		if t['confirm'] not in ('kasan_report', 'hook'):
+			return None, f"unknown confirm mode {t['confirm']!r}"
+		if t['args'] == 'ptr' and not t.get('access_size'):
+			return None, "args 'ptr' needs a positive access_size"
+
 		pedigree = []
 		for c in t['pedigree']:
 			if c[0] == 'frame':
@@ -713,13 +873,15 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			'store_fn':  f"{entry['store_fn']}@0x{resolved['store_addr']:x}",
 			'pedigree':  pedigree_desc,
 			'ctx':       entry['ctx'],
+			'confirm':   entry['confirm'],
 			'evidence':  ([] + (['source'] if entry['source'] else [])
 							 + (['dest'] if entry['dest'] else [])),
 		}
 		print(f"[analysis1] target {entry['id']!r}: hook="
 			  f"{entry['hook']}@0x{resolved['hook_addr']:x} "
 			  f"store_fn={entry['store_fn']}@0x{resolved['store_addr']:x} "
-			  f"ctx={entry['ctx']} pedigree={pedigree_desc}")
+			  f"ctx={entry['ctx']} confirm={entry['confirm']} "
+			  f"pedigree={pedigree_desc}")
 
 	if not targets:
 		print('[analysis1] WARNING: no catalogue target resolved — this replay '
@@ -1341,15 +1503,21 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			return True, None
 
 		def note_report(self, cpu, report):
-			"""kasan_report() ran while this window was open, and named an access
-			this window is about."""
+			"""The access really is out of bounds.
+
+			Either kasan_report() ran while this window was open and named an
+			access this window is about (confirm='kasan_report'), or the hook is
+			itself on KASAN's failure path and _on_hook_call synthesised the record
+			from its arguments (confirm='hook', report['via'] == 'hook')."""
 			if self.confirmed or self.closed:
 				return
 			self.report = report
 			self.report_exact = (report['addr'] == self.dst
 								 and report['size'] == self.req_size)
 			self.confirmed = True
-			print(f'[analysis1] kasan_report confirms window #{self.hit} '
+			what = ('reaching ' + self.target['hook'] if report.get('via') == 'hook'
+					else 'kasan_report')
+			print(f'[analysis1] {what} confirms window #{self.hit} '
 				  f'({self.target["id"]}) — write of size {report["size"]} at '
 				  f'0x{report["addr"]:x}, ip=0x{report["ip"]:x}'
 				  + ('' if self.report_exact else
@@ -1409,6 +1577,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				'outcome':  outcome,
 				'reason':   reason,
 				'confirmed_by_kasan_report': self.confirmed,
+				# How the confirmation was obtained: 'kasan_report' if an actual
+				# call to it was observed, 'hook' if the hook is itself on KASAN's
+				# failure path so reaching it was the report (see "THE THIRD
+				# SHAPE").  Kept out of the 'kasan_report' sub-dict below, which
+				# stays exactly the four arguments the report was handed.
+				'confirmed_via': (None if self.report is None
+								  else self.report.get('via', 'kasan_report')),
 				'dst':      hex(self.dst) if self.dst is not None else None,
 				'size':     self.req_size,
 				'watch_size': self.watch_size,
@@ -1497,15 +1672,35 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): no write to '
 					  f'0x{self.dst:x} was ever observed, so this is NOT a taint '
 					  f'negative [{result["reason"]}] ***')
-				print('[analysis1]   Expected when the caller ACTS on the check\'s '
-					  'return value.  KASAN\'s mem*() wrappers do: '
-					  '`if (!kasan_check_range(...)) return NULL;`, and '
-					  'kasan_check_range() returns `!kasan_report(...)` — so a check '
-					  'whose report was PRINTED vetoes the copy and there is no '
-					  'store to observe.  Not a taint negative.  See "GETTING THE '
-					  'STORE TO EXECUTE" at the top of this file: either patch the '
-					  'wrappers and re-record, or rely on a source-reading target '
-					  '(here: p9_read_work_src) which needs no store at all.')
+				if self.target['confirm'] == 'hook':
+					# The mem*() veto cannot be the cause here: this hook sits on
+					# KASAN's failure path and the instrumented code acts on nothing
+					# it returns, so the store was never vetoed and should have
+					# landed.  That makes this a defect in the target description
+					# rather than an expected outcome, so say so instead of
+					# offering the mem*() explanation.
+					print(f'[analysis1]   NOT the expected outcome for a '
+						  f'confirm=\'hook\' target: nothing acts on what '
+						  f'{self.target["hook"]} returns, so no check vetoed this '
+						  f'store and it should have landed.  Check, in order: '
+						  f'(a) store_fn={self.target["store_fn"]} returned before '
+						  f'the store — wrong store_fn, or the flagged path bails '
+						  f'out after the report instead of jumping back to it; '
+						  f'(b) the store landed somewhere other than the reported '
+						  f'0x{self.dst:x}+{self.req_size}; (c) the watcher was '
+						  f'never armed, i.e. no on_ret({self.target["hook"]}) '
+						  f'arrived — look for the "dest probe live" line above.')
+				else:
+					print('[analysis1]   Expected when the caller ACTS on the '
+						  'check\'s return value.  KASAN\'s mem*() wrappers do: '
+						  '`if (!kasan_check_range(...)) return NULL;`, and '
+						  'kasan_check_range() returns `!kasan_report(...)` — so a '
+						  'check whose report was PRINTED vetoes the copy and there '
+						  'is no store to observe.  Not a taint negative.  See '
+						  '"GETTING THE STORE TO EXECUTE" at the top of this file: '
+						  'either patch the wrappers and re-record, or rely on a '
+						  'source-reading target (here: p9_read_work_src) which '
+						  'needs no store at all.')
 			elif outcome == 'store_not_read':
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): a store landed at '
 					  f'pc={result["last_store_pc"]} but the probe never read the '
@@ -1554,15 +1749,34 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			return panda.arch.get_arg(cpu, 0), panda.arch.get_arg(cpu, 1), None
 		if kind == 'ptr_size_write':
 			# kasan_check_range(addr, size, write, ret_ip): reads are not our
-			# problem, and there are far more of them than writes.
-			if not panda.arch.get_arg(cpu, 2):
+			# problem, and there are far more of them than writes.  `write` is a C
+			# bool, i.e. the low byte of rdx — the rest of the register is whatever
+			# the caller left there, so mask before testing it or a read can look
+			# like a write.
+			if not (panda.arch.get_arg(cpu, 2) & 0xff):
 				return None, None, None
 			return panda.arch.get_arg(cpu, 0), panda.arch.get_arg(cpu, 1), None
+		if kind == 'ptr':
+			# __asan_report_store4_noabort(addr): the width is in the symbol name,
+			# so it comes from the catalogue rather than from a register.
+			return panda.arch.get_arg(cpu, 0), target['access_size'], None
 		if kind == 'memcpy':
 			# __asan_memcpy(to, from, size)
 			return (panda.arch.get_arg(cpu, 0), panda.arch.get_arg(cpu, 2),
 					panda.arch.get_arg(cpu, 1))
 		raise ValueError(f'unknown args convention {kind!r}')
+
+	def _hook_report_ip(cpu, target, stack):
+		"""The `ip` a real kasan_report would have been handed, for a
+		confirm='hook' target that has to synthesise its own report record.
+
+		kasan_report takes it as arg3 (`unsigned long ret_ip`, rcx), so read it
+		from the register when kasan_report is itself the hook.  The __asan_report_*
+		thunks do not take it at all — they compute _RET_IP_, which is their own
+		return address, i.e. callers[0]."""
+		if target['args'] == 'ptr_size_write':
+			return panda.arch.get_arg(cpu, 3)
+		return stack[0] if stack else 0
 
 	def _on_hook_call(cpu, addr, tlist):
 		"""A call to one of the catalogue hooks.
@@ -1634,6 +1848,23 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				  + ' (store not yet executed)')
 			log(f"{target['id']} hit #{hit}: dst=0x{dst:x} size={size}")
 			w.capture(cpu, dst, size, src)
+
+			# A hook that only exists on KASAN's failure path needs no second
+			# event: reaching it IS the report.  Synthesise the record from the
+			# hook's own arguments so the JSON carries the same four fields a real
+			# kasan_report would have given, and the same comparison against the
+			# report text is possible either way.
+			if target['confirm'] == 'hook':
+				w.note_report(cpu, {
+					'addr':     dst,
+					'size':     size,
+					# Every confirm='hook' entry is a store thunk; a load thunk
+					# would be an out-of-bounds READ, which is not what this
+					# module is for.
+					'is_write': True,
+					'ip':       _hook_report_ip(cpu, target, stack),
+					'via':      'hook',
+				})
 			return
 
 	def _on_kasan_report(cpu):
@@ -1649,10 +1880,15 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		It confirms every open window in the same task whose captured access the
 		report actually names; a hook nested inside another hook (memcpy ->
 		kasan_check_range) can legitimately have two windows open for one access.
+		A window whose target sets confirm='hook' was already confirmed at hook
+		entry and is skipped here by note_report's own guard.
+
+		NB this only runs when kasan_report is reached by a CALL.  A caller that
+		tail-jumps into it — __asan_report_store*_noabort does — produces no
+		on_call at all, which is why targets on that path confirm themselves; see
+		"THE THIRD SHAPE" in the module docstring.
 		"""
 		ctr['kasan_report'] += 1
-		if not state['windows']:
-			return
 
 		# bool kasan_report(unsigned long addr, size_t size, bool is_write,
 		#                   unsigned long ip)
@@ -1667,6 +1903,21 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print(f'[analysis1] kasan_report: '
 			  f'{"write" if report["is_write"] else "read"} of size '
 			  f'{report["size"]} at 0x{report["addr"]:x} (ip=0x{report["ip"]:x})')
+
+		# The frames, printed whether or not a window is open — this is how the
+		# NEXT catalogue entry gets written.  A KASAN report hands you
+		# `symbol+offset` and a pedigree needs a frame INDEX for it; the only way to
+		# know which index, or whether the frame is on the stack at all once tail
+		# calls are in play, is to see the stack the analysis itself sees.  Free,
+		# because kasan_report only runs when a range check has already failed.
+		stack = callers(cpu)
+		print(f'[analysis1]   kasan_report callers ({len(stack)} frame(s), '
+			  f'innermost first): '
+			  + ' '.join(f'[{i}]=0x{a:x}' for i, a in enumerate(stack[:8]))
+			  + (' ...' if len(stack) > 8 else ''))
+
+		if not state['windows']:
+			return
 
 		# process_name() is one OSI walk; kasan_report is rare, and every open
 		# window is compared against the same answer.
@@ -1920,15 +2171,23 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 		# 1. Catalogue hooks.  Dict lookup, then integer comparisons on the call
 		#    stack; only a matching pedigree gets as far as an OSI walk.
+		#
+		#    Deliberately does not return: a catalogue entry may hook kasan_report
+		#    ITSELF (see "THE THIRD SHAPE"), and that same call still has to
+		#    confirm every other open window.  Returning here would silently
+		#    disable the confirmation path for the whole replay the moment such an
+		#    entry is enabled.  Nothing past #2 can apply to a hook address, so the
+		#    two returns below cover both orders.
 		tlist = hook_targets.get(addr)
 		if tlist is not None:
 			_on_hook_call(cpu, addr, tlist)
-			return
 
 		# 2. The out-of-bounds signal.  No task filter here — the window itself
 		#    checks that the report fired in the task that opened it.
 		if addr == kasan_report_addr:
 			_on_kasan_report(cpu)
+			return
+		if tlist is not None:
 			return
 
 		# 3. Terminal condition, also unfiltered: a panic in ANY task ends the

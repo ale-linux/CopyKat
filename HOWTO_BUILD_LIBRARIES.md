@@ -25,14 +25,19 @@ Plugin output path:
 1. **Do NOT export `CFLAGS` with `-fpass-plugin` during `./configure`**:
    - `configure` compiles small test programs (e.g. `conftest.c`) and tries to link them as standalone executables.
    - If `-fpass-plugin` is active during `configure`, `kdo_store_callback` will be injected into `conftest.c`, causing `configure` to fail with `undefined reference to kdo_store_callback` / `C compiler cannot create executables`.
-   - **Solution**: Run `./configure` with `CFLAGS` unset (or standard flags), and pass `CFLAGS="-O0 -fpass-plugin=..."` directly to `make`.
+   - **Solution**: Run `./configure` with `CFLAGS` unset (or standard flags), and pass the plugin flags at the `make` step using the per-target variable (see below).
 
-2. **Pass Plugin Syntax**:
+2. **Use per-target `*_CFLAGS`, not `CFLAGS`, at the `make` step**:
+   - Passing plugin flags via `CFLAGS=...` to `make` causes libtool to forward them to the link step, where `ld` receives `-load` and fails with `cannot find -load`.
+   - The fix is to use the automake per-target variable (e.g. `libmnl_la_CFLAGS`). Libtool only applies these flags to compilation units for that target and never forwards them to the linker.
+   - You also need both `-Xclang -load -Xclang <plugin>` **and** `-fpass-plugin=<plugin>`: the former registers the pass option (`cl::opt`) with LLVM's option parser; the latter loads the plugin via the new pass manager so `-mllvm` arguments are recognised.
+
+3. **Pass Plugin Syntax**:
    ```bash
-   CFLAGS="-O0 -fpass-plugin=/path/to/LLVMKdoStorePass.so"
+   libmnl_la_CFLAGS="-O0 -Xclang -load -Xclang /path/to/LLVMKdoStorePass.so -fpass-plugin=/path/to/LLVMKdoStorePass.so -mllvm -kdo-store-db=/path/to/IDs.db"
    ```
 
-3. **Verifying Instrumentation**:
+4. **Verifying Instrumentation**:
    - For `.so` (shared libraries):
      ```bash
      objdump -dglS path/to/library.so | grep "call.*kdo"
@@ -56,6 +61,7 @@ export WORKSPACE="/home/aso/workdir"
 export PASS_PLUGIN="${WORKSPACE}/CopyKat/taint_verification/passes/build/kdo-store-pass/LLVMKdoStorePass.so"
 export CLANG_BIN="/home/aso/kno/llvm-project/build/bin/clang"
 export CC="${CLANG_BIN}"
+export KDO_DB="/path/to/IDs.db"   # path to your sorted SHA-256 IDs database
 ```
 
 ---
@@ -70,8 +76,10 @@ unset CFLAGS
 ./configure --prefix="${WORKSPACE}/install" --enable-static --enable-shared
 
 # 2. Build injecting the pass plugin via make
+#    Use the per-target variable to prevent libtool from forwarding
+#    plugin flags to the linker.
 make clean
-make V=1 CFLAGS="-O0 -fpass-plugin=${PASS_PLUGIN}" -j$(nproc)
+make V=1 libmnl_la_CFLAGS="-O0 -Xclang -load -Xclang ${PASS_PLUGIN} -fpass-plugin=${PASS_PLUGIN} -mllvm -kdo-store-db=${KDO_DB}" -j$(nproc)
 make install
 ```
 
@@ -92,8 +100,10 @@ unset CFLAGS
 ./configure --prefix="${WORKSPACE}/install" --enable-static --enable-shared
 
 # 3. Build injecting the pass plugin via make
+#    Use the per-target variable to prevent libtool from forwarding
+#    plugin flags to the linker.
 make clean
-make V=1 CFLAGS="-O0 -fpass-plugin=${PASS_PLUGIN}" -j$(nproc)
+make V=1 libnftnl_la_CFLAGS="-O0 -Xclang -load -Xclang ${PASS_PLUGIN} -fpass-plugin=${PASS_PLUGIN} -mllvm -kdo-store-db=${KDO_DB}" -j$(nproc)
 make install
 ```
 
