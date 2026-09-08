@@ -1101,6 +1101,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# in practice, but the guard is free.
 	handle_mm_fault_pending = {}
 	pending = {'refresh': False, 'zero_pages': []}
+	# Maps any address returned by mmap/brk -> backtrace list captured at that
+	# syscall return.  At zero-page drain time, the containing VMA is looked up
+	# and the first backtrace whose key falls within the VMA range is attached to
+	# the label, giving us the syscall origin for unwritten (zero) heap bytes.
+	vma_backtraces: dict[int, list] = {}
 
 	# ------------------------------------------------------------------
 	# Callbacks used by the destination probe
@@ -2030,6 +2035,17 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				  f'label {first_label} (vma {containing_vma["name"]} '
 				  f'0x{containing_vma["base"]:x}+{containing_vma["size"]})')
 			untranslatable = 0
+			# Best-effort: find the backtrace of the mmap/brk call that created the
+			# VMA containing this page.  Any key inside the VMA range qualifies —
+			# covers mmap (key == VMA base) and brk (key == new-brk somewhere inside
+			# the heap VMA).  Computed once per page, not per byte.
+			vma_base = containing_vma['base']
+			vma_end  = vma_base + containing_vma['size']
+			alloc_backtrace = next(
+				(bt for addr, bt in vma_backtraces.items()
+				 if vma_base <= addr < vma_end),
+				[],
+			)
 			# One page-table walk for the whole page instead of 4096.
 			page_paddrs = v2p_range(cpu, page_base, PAGE_SIZE)
 			for offset in range(PAGE_SIZE):
@@ -2038,9 +2054,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					untranslatable += 1
 					continue
 				label_map[ctr['labels']] = {
-					'virt_addr': hex(page_base + offset),
-					'backtrace': [],
-					'type': 'zero_page',
+					'virt_addr':       hex(page_base + offset),
+					'backtrace':       [],
+					'alloc_backtrace': alloc_backtrace,
+					'type':            'zero_page',
 				}
 				panda.taint_label_ram(taint_paddr, ctr['labels'])
 				ctr['labels'] += 1
@@ -2118,10 +2135,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		call_label = ctr['labels']
 		ctr['labels'] += 1
 		label_map[call_label] = {
-			'virt_addr': hex(ptr),
-			'len':       length,
-			'backtrace': backtrace,
-			'type':      'kdo_store',
+			'callback_id': store_id,
+			'virt_addr':   hex(ptr),
+			'len':         length,
+			'backtrace':   backtrace,
+			'type':        'kdo_store',
 		}
 		store_paddrs   = v2p_range(cpu, ptr, length)
 		untranslatable = 0
@@ -2299,6 +2317,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			f'(hint=0x{addr_hint:x} len=0x{length:x} '
 			f'prot=0x{prot:x} flags=0x{flags:x} fd={fd} offset=0x{offset:x})'
 		)
+		# Record the backtrace keyed by the returned VMA base so that
+		# _drain_zero_pages can attach the allocation site to zero-page labels.
+		if ret < (1 << 63):  # MAP_FAILED is ~0 — don't record error returns
+			vma_backtraces[ret] = [hex(a) for a in callers(cpu)]
 		# Don't refresh here — the kernel's maple-tree rewrite may not be fully
 		# committed at the syscall-return boundary.  Flag it so on_call refreshes
 		# on the next user-space block instead.
@@ -2310,6 +2332,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			return
 		ret = panda.arch.get_retval(cpu)
 		print(f'[analysis1] brk return: new_brk=0x{ret:x} (requested=0x{brk:x})')
+		# Record the backtrace keyed by the new-brk pointer.  At drain time we
+		# scan for any key within the heap VMA range, so the exact key value
+		# doesn't have to equal the VMA base.
+		if ret != 0:
+			vma_backtraces[ret] = [hex(a) for a in callers(cpu)]
 		# Same reasoning as mmap: defer the refresh to on_call.
 		pending['refresh'] = True
 
