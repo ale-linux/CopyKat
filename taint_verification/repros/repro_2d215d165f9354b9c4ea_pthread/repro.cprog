@@ -26,7 +26,7 @@
 #include <linux/futex.h>
 
 __attribute__((noinline, used))
-void kdo_store_callback(void *ptr, int len)
+void kdo_store_callback(int id, void *ptr, int len)
 {
     __asm__ volatile ("" ::: "memory");
 }
