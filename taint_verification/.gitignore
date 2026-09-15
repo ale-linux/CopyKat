@@ -1,2 +1,4 @@
 .*.un~
 repros/*/repro
+repros/*
+panda/out/*

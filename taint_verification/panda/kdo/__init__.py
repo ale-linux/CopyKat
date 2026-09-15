@@ -59,9 +59,11 @@ for src_file in $(find "$SRC" -type f -executable); do
     rel="${rel#/}"
     dst_file="$DST/$rel"
     if [ ! -e "$dst_file" ]; then
+        echo "[rsync-repros] copying $rel"
         install -D "$src_file" "$dst_file"
         CHANGED=true
     elif ! cmp -s "$src_file" "$dst_file"; then
+        echo "[rsync-repros] copying $rel"
         install -D "$src_file" "$dst_file"
         CHANGED=true
     fi
@@ -883,9 +885,14 @@ def parse_reports_json(reports_path, reports_json):
 
 	return repros
 
-def setup_rootfs_scripts(rootfs_path):
-	"""Install helper scripts into the rootfs tree (no repros baked in — those
-	are synced at runtime from the host share via rsync-repros)."""
+def setup_rootfs_scripts(rootfs_path, repros_src=None):
+	"""Install helper scripts into the rootfs tree.
+
+	If *repros_src* is given, pre-populate rootfs/repros/ by mirroring the
+	same layout the rsync-repros script produces at runtime: every executable
+	file found under *repros_src* is copied preserving its relative path, so
+	share_path/<repro_id>/repro lands at rootfs/repros/<repro_id>/repro.
+	"""
 	if not os.path.isdir(rootfs_path):
 		os.mkdir(rootfs_path)
 
@@ -895,3 +902,19 @@ def setup_rootfs_scripts(rootfs_path):
 	with open(rsync_script_path, 'w') as f:
 		f.write(rsync_repros_script)
 	os.chmod(rsync_script_path, os.stat(rsync_script_path).st_mode | stat.S_IEXEC)
+
+	# Pre-populate repros so they are baked into the qcow2 image.
+	# Mirror the rsync-repros layout: SRC/<rel> -> /repros/<rel>
+	# i.e. share_path/<repro_id>/repro -> rootfs/repros/<repro_id>/repro
+	if repros_src is not None:
+		repros_dst = os.path.join(rootfs_path, "repros")
+		for dirpath, _dirnames, filenames in os.walk(repros_src):
+			for fname in filenames:
+				src_file = os.path.join(dirpath, fname)
+				if not os.access(src_file, os.X_OK):
+					continue
+				rel = os.path.relpath(src_file, repros_src)
+				dst_file = os.path.join(repros_dst, rel)
+				os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+				shutil.copy2(src_file, dst_file)
+				print(f"[kdo] pre-populated repro: {rel}")

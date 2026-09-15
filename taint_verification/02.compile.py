@@ -40,14 +40,14 @@ def compile_c_repro(path, do_bug, outdir, clang, pass_plugin):
         # is registered (legacy PM path), then also inject via -fpass-plugin
         # for the new PM pipeline that actually runs the pass.
         cmd = [
-            clang, '-static', '-g', '-x', 'c', '-O0',
+            clang, '-Wno-return-type', '-static', '-g', '-x', 'c', '-O0',
             '-Xclang', '-load', '-Xclang', pass_plugin,
             f'-fpass-plugin={pass_plugin}',
             f'-mllvm=-kdo-store-db={id_db}',
             repro_c, '-o', repro_out_path,
         ]
     else:
-        cmd = [clang, '-static', '-g', '-x', 'c', '-O0', repro_c, '-o', repro_out_path]
+        cmd = [clang, '-Wno-return-type', '-static', '-g', '-x', 'c', '-O0', repro_c, '-o', repro_out_path]
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 

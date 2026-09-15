@@ -73,13 +73,17 @@ def _validate_kernel(kernel_name: str) -> None:
 
 
 def _build_kernel_and_rootfs(kernel_name: str, shared_rootfs_path: str,
-                              busybox_path: str) -> tuple:
+                              busybox_path: str, share_path: str) -> tuple:
     """
     Construct Kernel and Rootfs objects for *kernel_name*.
 
     *shared_rootfs_path* is the single staging tree under OUT_BASE that is
     shared across all kernels.  It is populated once (busybox symlinks + /init
     + helper scripts) and then packed by virt-make-fs into a per-kernel qcow2.
+
+    *share_path* is the host directory shared with the guest via 9p.  When the
+    qcow2 does not yet exist it is passed to setup_rootfs_scripts so that
+    repros are pre-populated into the image at creation time.
 
     Must be called while cwd == OUT_BASE (enforced by assertion inside).
     Chdirs into the per-kernel output directory so that kernelinfo.conf
@@ -96,9 +100,11 @@ def _build_kernel_and_rootfs(kernel_name: str, shared_rootfs_path: str,
     os.chdir(out_kdir)
 
     image_path = os.path.join(out_kdir, "rootfs.qcow2")
+    image_exists = os.path.isfile(image_path)
 
-    # Write helper scripts into the shared staging tree before packing.
-    kdo.setup_rootfs_scripts(shared_rootfs_path)
+    # Write helper scripts (and pre-populate repros when creating fresh image).
+    kdo.setup_rootfs_scripts(shared_rootfs_path,
+                             repros_src=None if image_exists else share_path)
 
     kernel = Kernel(_kernel_dir(kernel_name))
 
@@ -107,7 +113,7 @@ def _build_kernel_and_rootfs(kernel_name: str, shared_rootfs_path: str,
         image_path=image_path,
         rootfs_path=shared_rootfs_path,
         busybox_path=busybox_path,
-        avoid_create=os.path.isfile(image_path),
+        avoid_create=image_exists,
     )
 
     # Restore working directory to OUT_BASE.
@@ -167,7 +173,8 @@ def main() -> None:
 
     for kernel_name in sorted(unique_kernels):
         print(f"[run-repros] initialising kernel/rootfs for {kernel_name!r} ...")
-        kernel, rootfs = _build_kernel_and_rootfs(kernel_name, shared_rootfs_path, busybox_path)
+        kernel, rootfs = _build_kernel_and_rootfs(kernel_name, shared_rootfs_path, busybox_path,
+                                                  str(args.share_path))
         kernel_map[kernel_name] = kernel
         rootfs_map[kernel_name] = rootfs
         assert os.path.realpath(os.getcwd()) == os.path.realpath(OUT_BASE), \
