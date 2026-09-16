@@ -53,7 +53,6 @@ class NestablePool(multiprocessing.pool.Pool):
 
 
 share_path = None
-multi_shot = False
 
 
 def doit(repro):
@@ -61,6 +60,10 @@ def doit(repro):
     kernel_name = repro['kernel']
     out_kdir    = os.path.join(OUT_BASE, kernel_name)
     repro_out   = os.path.join(OUT_BASE, repro_id)
+
+    sink_call_id = int(repro['call_id'])
+    target_addr  = repro['dst_addr']
+    cfu_dst      = repro['src_addr']
 
     print(f"[run-analysis] starting {repro_id!r} (kernel={kernel_name!r})")
 
@@ -92,21 +95,8 @@ def doit(repro):
     # Recording files live in the repro output dir; replay must run from there.
     os.chdir(repro_out)
 
-    if multi_shot:
-        # A multi-shot run deliberately keeps going past the first confirmed
-        # violation, which means it runs into this recording's desync point and
-        # is killed by SIGABRT — rrr surfaces that as "Replay failed -6".
-        # Every hit has already been flushed to analysis1.json by then, so
-        # report it and carry on rather than letting one expected abort take
-        # down the whole pool.map batch.
-        try:
-            analysis1.replay(rootfs, kernel, stop_on_first_violation=False)
-        except Exception as e:
-            print(f"[run-analysis] {repro_id}: replay ended with {e!r} — expected "
-                  f"in --multi-shot; results already written to analysis1.json")
-            return 'aborted-after-collection'
-    else:
-        analysis1.replay(rootfs, kernel)
+    analysis1.replay(rootfs, kernel, sink_call_id=sink_call_id,
+                     target_addr=[target_addr], cfu_dst=cfu_dst)
 
     return True
 
@@ -127,16 +117,10 @@ def main() -> None:
                  'Used for symbol parsing AND to give the replayed machine the '
                  'same virtio-9p device the recording was made with — pass the '
                  'same value run-repros.py was given')
-    opts.add_argument('--multi-shot', action='store_true',
-            help='collect every OOB violation instead of stopping at the first '
-                 'confirmed one; analysis1.json is rewritten after each hit')
     args = opts.parse_args()
 
-    global share_path, multi_shot
+    global share_path
     share_path = args.share_path
-    multi_shot = args.multi_shot
-    if multi_shot:
-        print('[run-analysis] --multi-shot: collecting all violations')
 
     # Recording ran with kdo.update_config(share_path), which appends
     # `-fsdev local,... -device virtio-9p-pci,...` to the QEMU machine args.
