@@ -1011,7 +1011,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		range we could actually look at.  Uses one page-table walk per page and
 		then touches shadow memory only."""
 		meta = {'requested': length, 'read': 0, 'untranslatable': 0,
-				'clamped': False, 'taint_enabled': panda.taint_enabled()}
+				'clamped': False, 'taint_enabled': panda.taint_enabled(),
+				# Where this reading was taken from, so the reported taint can be
+				# tied back to the guest code that was running when the shadow was
+				# sampled.  Recorded on every return path, including the ones that
+				# read nothing.
+				'backtrace': [hex(panda.arch.get_pc(cpu))] + [hex(a) for a in callers(cpu)]}
 		tainted = {}
 		if length <= 0:
 			return tainted, meta
@@ -1722,6 +1727,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): {outcome} '
 					  f'[{result["reason"]}] ***')
 
+			if read and read['meta'].get('backtrace'):
+				bt = read['meta']['backtrace']
+				print(f'[analysis1]   taint read at ({len(bt)} frame(s), innermost '
+					  f'first): ' + ' '.join(f'[{i}]={a}' for i, a in
+											 enumerate(bt[:8]))
+					  + (' ...' if len(bt) > 8 else ''))
 			if read and read['meta']['untranslatable']:
 				print(f'[analysis1]   note: {read["meta"]["untranslatable"]}/'
 					  f'{read["meta"]["read"]} bytes were not translatable')
