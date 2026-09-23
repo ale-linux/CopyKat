@@ -3,139 +3,159 @@
 import argparse
 import json
 import os
-import re
-import shutil
 import sys
 
 import rrr
-from rrr import Stimulus, Rootfs, Kernel, config
+from rrr import Rootfs, Kernel
 from kdo import analysis2
 import time
 
 import multiprocessing as mp
-
 import multiprocessing.pool
 
-class NoDaemonProcess(multiprocessing.Process):
-	@property
-	def daemon(self):
-		return False
 
-	@daemon.setter
-	def daemon(self, value):
-		pass
+# Filesystem layout (produced by run-repros.py, consumed here):
+#
+#   /root/kernel/<kernel_name>/      — pre-built kernel tree (read-only)
+#   /root/out/
+#       rootfs/                      — shared rootfs staging tree
+#       busybox/                     — shared busybox build
+#       <kernel_name>/
+#           rootfs.qcow2             — snapshotted VM disk image
+#           kernelinfo.conf          — PANDA OSI offsets
+#       <repro_id>/
+#           record-rr-nondet.log     — recording to replay
+#           record-rr-snp            — recording snapshot
+#           analysis2.json           — output written here
 
-class NoDaemonContext(type(multiprocessing.get_context())):
-	Process = NoDaemonProcess
+KERNEL_BASE = "/root/kernel"
+OUT_BASE    = "/root/out"
+
+
+class NoDaemonProcess(mp.Process):
+    @property
+    def daemon(self):
+        return False
+
+    @daemon.setter
+    def daemon(self, value):
+        pass
+
+class NoDaemonContext(type(mp.get_context())):
+    Process = NoDaemonProcess
 
 # We sub-class multiprocessing.pool.Pool instead of multiprocessing.Pool
 # because the latter is only a wrapper function, not a proper class.
 class NestablePool(multiprocessing.pool.Pool):
-	def __init__(self, *args, **kwargs):
-		kwargs['context'] = NoDaemonContext()
-		super(NestablePool, self).__init__(*args, **kwargs)
+    def __init__(self, *args, **kwargs):
+        kwargs['context'] = NoDaemonContext()
+        super(NestablePool, self).__init__(*args, **kwargs)
+
+
+share_path = None
+
 
 def doit(repro):
-	os.chdir("/root/out")
+    repro_id    = repro['id']
+    kernel_name = repro['kernel']
+    out_kdir    = os.path.join(OUT_BASE, kernel_name)
+    repro_out   = os.path.join(OUT_BASE, repro_id)
 
-	image_path = f'rootfs.qcow2'
-	rootfs_path = "rootfs/"
-	busybox_path="busybox/"
+    sink_call_id   = int(repro['call_id'])
+    target_addr    = repro['dst_addr']
+    ref_memcpy_ctr = repro.get('replay', {}).get('memcpy_ctr', -1)
 
-	image_path = os.path.join(os.getcwd(), image_path)
-	rootfs_path = os.path.join(os.getcwd(), rootfs_path)
-	busybox_path = os.path.join(os.getcwd(), busybox_path)
+    print(f"[run-analysis2] starting {repro_id!r} (kernel={kernel_name!r})")
 
-	rootfs = Rootfs(
-			None,
-			image_path=image_path,
-			rootfs_path=rootfs_path,
-			busybox_path=busybox_path,
-			avoid_create=(os.path.isfile(image_path)))
-	kernel = Kernel('/root/kernel')
-	# if args.repro_id and args.repro_id != repro['id']: continue
+    # Kernel.__init__ writes kernelinfo.conf into os.getcwd(), so we must be
+    # in the per-kernel output dir when constructing it.  All kernel/btf files
+    # already exist (run-repros.py built them), so the constructor only sets
+    # attributes — no build work happens.
+    os.chdir(out_kdir)
+    kernel = Kernel(os.path.join(KERNEL_BASE, kernel_name))
 
-	print("starting on ", repro['id'])
+    image_path   = os.path.join(out_kdir, "rootfs.qcow2")
+    rootfs = Rootfs(
+        None,
+        image_path=image_path,
+        rootfs_path=os.path.join(OUT_BASE, "rootfs"),
+        busybox_path=os.path.join(OUT_BASE, "busybox"),
+        avoid_create=True,
+    )
 
-	repro_id = repro['id']
-	callid = int(repro['call_id'])
-	target_addr = repro['record']['dst_addr']
-	cfu_dst_addr = repro['record']['src_addr']
-	ctr = repro["replay"]["memcpy_ctr"]
+    # Point rootfs at the per-repro binary so rrr.replay() parses its symbols.
+    if share_path:
+        repro_bin = os.path.join(share_path, repro_id, "repro")
+        if os.path.isfile(repro_bin):
+            rootfs.stimulus_debug_path = repro_bin
+            print(f"[run-analysis2] using repro binary: {repro_bin}")
+        else:
+            print(f"[run-analysis2] warning: repro binary not found at {repro_bin}")
 
-	if not os.path.exists(repro_id):
-		os.makedirs(repro_id)
+    # Recording files live in the repro output dir; replay must run from there.
+    os.chdir(repro_out)
 
-	os.chdir(repro_id)
+    analysis2.replay(rootfs, kernel, sink_call_id=sink_call_id,
+                     target_addr=[target_addr], ref_memcpy_ctr=ref_memcpy_ctr)
 
-	analysis2.replay(rootfs, kernel, sink_call_id=callid, target_addr=[target_addr], ref_memcpy_ctr=ctr)
+    return True
 
-	return True
 
 def main() -> None:
-	opts = argparse.ArgumentParser(
-			description='Run all the repros with panda syz-rrr')
-	opts.add_argument('--record-file', type=argparse.FileType('r'), required=True,
-			help='reports json exported by extract-info.py')
-	opts.add_argument('--repro-id', nargs='*', required=False, help='repro id to reproduce')
-	opts.add_argument('--npar', type=int, default=mp.cpu_count(), required=False, help='parallelism')
-	opts.add_argument('--rerun', action='store_true', help='rerun the analysis only for the undone')
-	args = opts.parse_args()
+    opts = argparse.ArgumentParser(
+            description='Run analysis2 replay over recordings from run-repros.py')
+    opts.add_argument('--record-file', type=argparse.FileType('r'), required=True,
+            help='JSON output from run-repros.py (contains id + kernel per entry)')
+    opts.add_argument('--repro-id', nargs='*', required=False,
+            help='only run these specific repro ids')
+    opts.add_argument('--npar', type=int, default=mp.cpu_count(), required=False,
+            help='parallelism (default: cpu count)')
+    opts.add_argument('--rerun', action='store_true',
+            help='only run entries whose analysis2.json is missing')
+    opts.add_argument('--share-path', type=str, required=False,
+            help='host share directory containing <repro_id>/repro binaries.  '
+                 'Used for symbol parsing AND to give the replayed machine the '
+                 'same virtio-9p device the recording was made with — pass the '
+                 'same value run-repros.py was given')
+    args = opts.parse_args()
 
-	analysis2.update_config()
+    global share_path
+    share_path = args.share_path
 
-	os.chdir("/root/out")
+    # Recording ran with kdo.update_config(share_path), which appends
+    # `-fsdev local,... -device virtio-9p-pci,...` to the QEMU machine args.
+    # Replaying without those gives the replayed machine a different PCI device
+    # set than the recorded one, which is a good way to make a replay diverge —
+    # so pass the same share path through when we have it.
+    analysis2.update_config(share_path=args.share_path)
 
-	repros = json.load(args.record_file)
+    os.chdir(OUT_BASE)
+    assert os.path.realpath(os.getcwd()) == os.path.realpath(OUT_BASE)
 
-	## # repro_id = "d73eeb2bc242f73eaaba9f0ef8118f82e93bb55b" # no taint
-	## repro_id = "ac3bad7a701d9e0e4c6e3cce1f68392a5787dab7" # did not crash
-	## # repro_id = "6e675f56f166258c81bc8343ed6b2207f05a00e6" # af_x25
-	## # repro_id = "7857221bdd5e7ccc9978bf7dd186ac5157bcdb7b" # msg_msg
-	## #repro_id = "c9f21bbd839ed1c76b88278ed7c77de8b7ac7c8f"
-	## #repro_id = "428efbae6f77ce4c31be437177416ce2b15d7786" super slow
+    repros = json.load(args.record_file)
 
-	#################
-	# 3) get rootfs #
-	#################
+    # Only replay entries that actually crashed (no 'err' key).
+    crashed = [r for r in repros if 'err' not in r]
 
-	print(f'Starting with parallelism {args.npar}')
-	pool = NestablePool(args.npar)
+    if args.repro_id:
+        wanted = set(args.repro_id)
+        torun = [r for r in crashed if r['id'] in wanted]
+    elif args.rerun:
+        torun = [
+            r for r in crashed
+            if not os.path.isfile(os.path.join(OUT_BASE, r['id'], 'analysis2.json'))
+        ]
+        for r in torun:
+            print(f"[run-analysis2] queued (missing analysis2.json): {r['id']}")
+    else:
+        torun = crashed
 
-	if args.repro_id:
-		tmp = dict()
-		for e in args.repro_id:
-			tmp[e] = True
-		torun = [r for r in repros if r['id'] in tmp]
+    print(f"[run-analysis2] {len(torun)} repro(s) to analyse (parallelism={args.npar})")
 
-		res = pool.map(doit, torun)
+    pool = NestablePool(args.npar)
+    res = pool.map(doit, torun)
+    print(res)
 
-		print(res)
-
-		return
-	elif args.rerun:
-		rr = []
-		for r in repros:
-			if 'err' in r: continue
-			af = os.path.join("/root/out/", r["id"], "analysis.json")
-			if not os.path.isfile(af):
-				rr.append(r)
-				print(r['id'])
-				continue
-
-		return
-		res = pool.map(doit, rr)
-
-		print(res)
-	else:
-		torun = [r for r in repros if "replay" in r and "err" not in r["replay"]]
-
-		res = pool.map(doit, torun)
-
-		print(res)
-
-		return
 
 if __name__ == '__main__':
-	main()
-
+    main()

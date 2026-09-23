@@ -17,7 +17,7 @@ import re
 import faulthandler
 import tempfile
 
-pattern = re.compile(r"repro-[0-9a-f]+$")
+pattern = re.compile(r"repro$")
 
 kdo_label_nr = 1
 kdo_taint_addr = None
@@ -90,7 +90,11 @@ conf = config
 conf["expect_prompt"] = expect_prompt
 conf["init_code"] = init_code
 
-def update_config():
+def update_config(share_path=None):
+	if share_path is not None:
+		import kdo
+		kdo.update_config(share_path)
+		return
 	rrr.update_config(conf)
 
 repro_crashed = True
@@ -183,10 +187,10 @@ def __replay(rootfs, kernel, record, ignored_addresses, func_map, symbol_map,
 	kdo_set_storedonheap_addr = symbol_map.get('kdo_set_storedonheap', None).address
 	propagate_taint_addr = symbol_map.get('propagate_taint', None).address
 	kdo_post_store_hook_addr = symbol_map.get('kdo_post_store_hook', None).address
-	kmem_cache_alloc_addr = symbol_map.get('kmem_cache_alloc', None).address
-	kmem_cache_alloc_lru_addr = symbol_map.get('kmem_cache_alloc_lru', None).address
-	kmem_cache_alloc_node_addr = symbol_map.get('kmem_cache_alloc_node', None).address
-	kmalloc_addr = symbol_map.get('__kmalloc', None).address
+	kmem_cache_alloc_addr = symbol_map.get('kmem_cache_alloc_noprof', None).address
+	kmem_cache_alloc_lru_addr = symbol_map.get('kmem_cache_alloc_lru_noprof', None).address
+	kmem_cache_alloc_node_addr = symbol_map.get('kmem_cache_alloc_node_noprof', None).address
+	kmalloc_addr = symbol_map.get('__kmalloc_noprof', None).address
 	__kasan_kmalloc_addr = symbol_map.get('__kasan_kmalloc', None).address
 	__kasan_krealloc_addr = symbol_map.get('__kasan_krealloc', None).address
 	__kasan_slab_alloc_addr = symbol_map.get('__kasan_slab_alloc', None).address
@@ -350,11 +354,26 @@ def __replay(rootfs, kernel, record, ignored_addresses, func_map, symbol_map,
 			ptr = panda.arch.get_return_value(cpu)
 			rsp = panda.arch.get_reg(cpu, "RSP")
 
-			cachep = kdo_callstack[rsp-8]["arg"]
-			size = panda.virtual_memory_read(cpu, cachep+28, 0x4, fmt="int")		# object_size 28
-			cachename_p = panda.virtual_memory_read(cpu, cachep+96, 8, fmt="int")   # name 96
-			cachename = panda.virtual_memory_read(cpu, cachename_p, 40, fmt="str")
-			del kdo_callstack[rsp-8]
+			entry = kdo_callstack.pop(rsp-8, None)
+			if entry is None:
+				print(f'[analysis2] on_ret: no callstack entry for rsp-8={hex(rsp-8)}, skipping')
+				return
+			cachep = entry["arg"]
+			if not cachep:
+				print(f'[analysis2] on_ret: cachep is NULL, skipping allocation record')
+				return
+			try:
+				size = panda.virtual_memory_read(cpu, cachep+52, 0x4, fmt="int")	# object_size @ +52
+				cachename_p = panda.virtual_memory_read(cpu, cachep+120, 8, fmt="int")  # name @ +120
+				if not cachename_p:
+					print(f'[analysis2] on_ret: cachename_p is NULL for cachep={hex(cachep)}, using <unknown>')
+					cachename = "<unknown>"
+				else:
+					cachename = panda.virtual_memory_read(cpu, cachename_p, 40, fmt="str")
+			except ValueError as e:
+				print(f'[analysis2] on_ret: failed to read kmem_cache fields at cachep={hex(cachep)}: {e}')
+				size = 0
+				cachename = "<unknown>"
 
 			kdo_allocations[ptr] = {
 				"cache": str(cachename),
@@ -611,6 +630,9 @@ def __replay(rootfs, kernel, record, ignored_addresses, func_map, symbol_map,
 		fname = fname_bytes.split(b'\x00', 1)[0].decode('utf-8')  # Decode the null-terminated string
 
 		print(f"execve enter: {fname}")
+
+		if os.path.basename(fname) != 'repro':
+			return
 
 		d1 = panda.ppp("syscalls2", "on_all_sys_enter")
 		d1(all_sysenter)
