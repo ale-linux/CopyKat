@@ -111,7 +111,27 @@ def doit(repro):
     return True
 
 
+def check_max_map_count() -> None:
+    path = "/proc/sys/vm/max_map_count"
+    try:
+        with open(path, "r") as f:
+            val = int(f.read().strip())
+        if val <= 65536:
+            print(
+                f"[run-analysis] WARNING: {path} is {val} (<= 65536). "
+                f"Replay will fail due to mmap limits. Please increase it (e.g. sysctl -w vm.max_map_count=1048576).",
+                file=sys.stderr,
+            )
+            return False
+    except Exception as e:
+        print(f"[run-analysis] warning: unable to check {path}: {e}", file=sys.stderr)
+    return True
+
+
 def main() -> None:
+    if not check_max_map_count():
+        return
+
     opts = argparse.ArgumentParser(
             description='Run analysis1 replay over recordings from run-repros.py')
     opts.add_argument('--record-file', type=argparse.FileType('r'), required=True,
