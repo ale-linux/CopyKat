@@ -924,7 +924,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# Counters are in a dict so nested callbacks can bump them without `nonlocal`
 	# gymnastics.  Hook counters count ALL calls in ALL tasks — they exist to say
 	# how much noise the pedigree filter is removing, so they must not be gated.
-	ctr = {'hook_calls': {}, 'target_hits': {}, 'kasan_report': 0, 'labels': 1}
+	ctr = {'hook_calls': {}, 'target_hits': {}, 'kasan_report': 0, 'labels': 1,
+		   'store_id_calls': {}}
 	# Set once the answer is in and panda.end_analysis() has been queued.  The
 	# stop is asynchronous (queue_async(stop_run)) so hooks keep firing for a
 	# while; and panda.ending makes pandare's enable_callback() a silent no-op
@@ -2088,6 +2089,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		store_id = panda.arch.get_arg(cpu, 0)
 		ptr      = panda.arch.get_arg(cpu, 1)
 		length   = panda.arch.get_arg(cpu, 2)
+		# Increment and snapshot the per-store_id call counter BEFORE any early
+		# return, so every call (including zero-length skips) is counted.  This
+		# lets a tracer know "hook kdo_store_callback when store_id==X for the
+		# N-th time" to land exactly on the call that created a specific label.
+		store_id_ctr = ctr['store_id_calls'].get(store_id, 0) + 1
+		ctr['store_id_calls'][store_id] = store_id_ctr
 		length   = length if length < (1 << 31) else length - (1 << 32)
 
 		if length <= 0:
@@ -2146,11 +2153,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		call_label = ctr['labels']
 		ctr['labels'] += 1
 		label_map[call_label] = {
-			'callback_id': store_id,
-			'virt_addr':   hex(ptr),
-			'len':         length,
-			'backtrace':   backtrace,
-			'type':        'kdo_store',
+			'callback_id':     store_id,
+			'callback_id_ctr': store_id_ctr,
+			'virt_addr':       hex(ptr),
+			'len':             length,
+			'backtrace':       backtrace,
+			'type':            'kdo_store',
 		}
 		store_paddrs   = v2p_range(cpu, ptr, length)
 		untranslatable = 0
