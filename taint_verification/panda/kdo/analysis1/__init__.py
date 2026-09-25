@@ -1013,11 +1013,24 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		then touches shadow memory only."""
 		meta = {'requested': length, 'read': 0, 'untranslatable': 0,
 				'clamped': False, 'taint_enabled': panda.taint_enabled(),
-				# Where this reading was taken from, so the reported taint can be
-				# tied back to the guest code that was running when the shadow was
-				# sampled.  Recorded on every return path, including the ones that
-				# read nothing.
-				'backtrace': [hex(panda.arch.get_pc(cpu))] + [hex(a) for a in callers(cpu)]}
+				# Where the guest happened to be standing when this callback ran.
+				# NOT the access the reading is about, and deliberately not named
+				# 'backtrace': it is an artifact of WHEN we chose to sample, so its
+				# innermost frames differ between two readings of the same access.
+				# A deferred source read samples at the call to kasan_report, so it
+				# carries three frames of KASAN plumbing (kasan_report <-
+				# kasan_check_range <- the mem*() wrapper) that the hook-entry read
+				# of the very same buffer does not; a dest read samples from the
+				# probe, whose pc is the storing instruction on some targets and the
+				# block it sits in on others — close to the access, but do not rely
+				# on it.  For the site a report would name use the observation's
+				# 'hook_backtrace', and for the storing instruction last_store_pc.
+				#
+				# It is the ONLY record of position for a reading with no window
+				# behind it — analysis['sink'] — which is why it is kept for all of
+				# them rather than pushed onto the callers.  Recorded on every return
+				# path, including the ones that read nothing.
+				'sampled_at': [hex(panda.arch.get_pc(cpu))] + [hex(a) for a in callers(cpu)]}
 		tainted = {}
 		if length <= 0:
 			return tainted, meta
@@ -1042,6 +1055,67 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				log(f'  taint: {what}[{off}] @ 0x{base + off:x} (pa 0x{paddr:x}) '
 					f'labels={lbls} resolved={resolved}')
 		return tainted, meta
+
+	def _access_record(meta, hook_bt, store_pc=None):
+		"""WHERE THE TAINT IN THIS READING WAS READ.  One field, every reading.
+
+		This is the field to look at for that question, and it is on the reading
+		rather than the observation so that it exists exactly when a reading does.
+		'pc' is the single address; 'pc_is' says what that address positionally IS,
+		because the two cases genuinely differ and no one address can paper over it:
+
+		  'store_pc'         the EXACT address of the instruction that stored, as
+		                     OBSERVED by cb_virt_mem_after_write.  Dest readings
+		                     only, and the only case where 'exact' is True.
+		  'call_return_addr' the return address of the `call` that performs the
+		                     access — a mem*() helper for a source reading, sink()
+		                     for the sink.  The access is the `call` immediately
+		                     below 'pc'; its length is not recorded, so this is the
+		                     closest address the analysis can honestly name.
+
+		Why not get_pc()?  meta['sampled_at'][0] is useless as the access for a
+		dest reading: inside an after_insn_exec callback env->eip has not been
+		synced, so get_pc() returns the ENTRY PC OF THE CURRENT TRANSLATION BLOCK.
+		It happens to equal the store when the store begins a block and does not
+		otherwise — fuse_dev_do_write +0x196c (equal) vs bitmap_ip_add +0x3ca where
+		the store is at +0x3d4.  The watcher's pc is the real one.
+
+		The tail comes from the same callers() sample as the rest of the reading,
+		so this is one stack from one instant rather than two spliced together.
+		The one place frame 0 and the tail come from different instants is a dest
+		reading — watcher at store time, callers() at probe time — so
+		'tail_matches_hook_entry' PUBLISHES the invariant instead of assuming it:
+		nothing in the module constrains the store to the hook caller's activation
+		(oob_probe_gate is deliberately unrestricted and oob_write_watcher filters
+		on the dst range alone), so a store from a deeper callee, another task or
+		an IRQ would make the stack a chimera.  None means unknowable because
+		callers() truncated at CALLER_DEPTH.
+
+		NB this matches NO pedigree and appears in NO KASAN report: frame 0 of a
+		dest reading is thousands of bytes from what the report prints (+0x196c vs
+		the reported +0x3088).  For those use the observation's hook_backtrace and
+		kasan_report['ip']."""
+		sampled = meta['sampled_at']
+		if store_pc is not None:
+			truncated = (len(sampled) >= CALLER_DEPTH
+						 or len(hook_bt) >= CALLER_DEPTH)
+			return {'pc': store_pc, 'pc_is': 'store_pc', 'exact': True,
+					'backtrace': [store_pc] + sampled[1:],
+					'tail_from': 'reading_callers',
+					'tail_matches_hook_entry': (None if truncated else
+												sampled[1:] == list(hook_bt[1:]))}
+		if hook_bt:
+			# Source reading: the access IS the call into the hook, so the stack
+			# taken at hook entry already is the stack of the access.
+			return {'pc': hook_bt[0], 'pc_is': 'call_return_addr', 'exact': False,
+					'backtrace': list(hook_bt), 'tail_from': 'hook_entry',
+					'tail_matches_hook_entry': None}
+		# The sink, which has no window: sampled[0] is sink()'s own entry pc, a
+		# constant carrying no information, so drop it and start at the caller.
+		return {'pc': sampled[1] if len(sampled) > 1 else None,
+				'pc_is': 'call_return_addr', 'exact': False,
+				'backtrace': sampled[1:], 'tail_from': 'reading_callers',
+				'tail_matches_hook_entry': None}
 
 	def callers(cpu, depth=CALLER_DEPTH):
 		"""Return the call stack, shortest-first, with the padding removed.
@@ -1310,6 +1384,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					self.debug_reading = {
 						'kind': 'source@entry', 'base': hex(src),
 						'tainted_bytes': tainted, 'meta': meta,
+						'access': _access_record(meta, self.entry['backtrace']),
 					}
 					if tainted:
 						offs = sorted(tainted)
@@ -1383,7 +1458,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			src, and the copy itself has not run yet."""
 			tainted, meta = read_taint_range(cpu, self.src, self.req_size, 'src')
 			self.reading = {'kind': 'source', 'base': hex(self.src),
-							'tainted_bytes': tainted, 'meta': meta}
+							'tainted_bytes': tainted, 'meta': meta,
+							'access': _access_record(meta, self.entry['backtrace'])}
 			if tainted:
 				print(f'[analysis1]   source taint: {len(tainted)}/{meta["read"]} '
 					  f'bytes at 0x{self.src:x} carry labels')
@@ -1459,10 +1535,20 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					 if self.last_store_pc is not None else None)
 			adjacent = delta is not None and 0 < delta <= 15
 
+			# Frozen HERE, not read back from self.last_store_pc later: the watcher
+			# stays armed until the window closes, so a further store into dst
+			# would otherwise retag a reading that has already been taken.  A dest
+			# reading always has one — read_dest_taint's only caller checks
+			# store_seen first — so this is never None in practice.
+			store_pc = (hex(self.last_store_pc)
+						if self.last_store_pc is not None else None)
+
 			self.taint_read = True
 			self.reading = {
 				'kind': 'dest', 'base': hex(self.dst),
 				'tainted_bytes': tainted, 'meta': meta,
+				'access': _access_record(meta, self.entry['backtrace'],
+										 store_pc=store_pc),
 				'probe_pc': hex(probe_pc), 'probe_adjacent': adjacent,
 				'probe_delta': delta,
 			}
@@ -1588,6 +1674,32 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				'outcome':  outcome,
 				'reason':   reason,
 				'confirmed_by_kasan_report': self.confirmed,
+				# Where the taint reported here was read, at the granularity a
+				# report names it: the call stack at the hook that opened this
+				# window, innermost first.
+				#
+				# Frame 0 is the RETURN ADDRESS of the call into the hook, NOT the
+				# accessing instruction.  That makes it exactly what the KASAN
+				# report prints and what a pedigree matches on, but it is NOT where
+				# the access is: under CONFIG_KASAN_INLINE the compiler puts the
+				# call to the report thunk in a cold out-of-line block whose return
+				# address is a `jmp` back to the access, so frame 0 can be
+				# thousands of bytes from the store.  fuse_dev_do_write is the
+				# worked example — frame 0 at +0x3088 (a `jmp`), the store it is
+				# about at +0x196c.  For the storing instruction itself use
+				# first_store_pc/last_store_pc, which the memory watcher OBSERVED
+				# rather than inferred; for a source target there is no store to
+				# observe and the access is the call immediately below frame 0.
+				#
+				# Captured once at hook entry, so it is here on EVERY observation —
+				# including the ones with no reading at all ('unconfirmed',
+				# 'store_never_executed'), where it is the only record of what was
+				# looked at.  Deliberately not on the readings: a window has one
+				# hook entry, so every reading would carry the same list.  For WHEN
+				# each reading sampled the shadow, which does differ between them,
+				# see that reading's meta['sampled_at']; for where the taint was
+				# WRITTEN, see tainted_bytes[off]['resolved'].
+				'hook_backtrace': self.entry['backtrace'],
 				# How the confirmation was obtained: 'kasan_report' if an actual
 				# call to it was observed, 'hook' if the hook is itself on KASAN's
 				# failure path so reaching it was the report (see "THE THIRD
@@ -1625,6 +1737,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					# buffer actually held.
 					{'kind': 'source@entry', 'base': self.debug_reading['base'],
 					 'tainted_bytes': {}, 'meta': self.debug_reading['meta'],
+					 'access': self.debug_reading['access'],
 					 'value': self.debug_reading.get('value'),
 					 'value_unreadable_offsets':
 						 self.debug_reading.get('value_unreadable_offsets')}
@@ -1728,12 +1841,39 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): {outcome} '
 					  f'[{result["reason"]}] ***')
 
-			if read and read['meta'].get('backtrace'):
-				bt = read['meta']['backtrace']
-				print(f'[analysis1]   taint read at ({len(bt)} frame(s), innermost '
-					  f'first): ' + ' '.join(f'[{i}]={a}' for i, a in
-											 enumerate(bt[:8]))
+			# Where a report would say this happened — frame 0 is the return
+			# address of the call into the hook, which is the address KASAN prints,
+			# not the accessing instruction.  Printed for every outcome, since an
+			# INCONCLUSIVE one is exactly when you want to know what was looked at.
+			bt = result['hook_backtrace']
+			if bt:
+				print(f'[analysis1]   reported at ({len(bt)} frame(s), innermost '
+					  f'first, [0] is the call\'s return address): '
+					  + ' '.join(f'[{i}]={a}' for i, a in enumerate(bt[:8]))
 					  + (' ...' if len(bt) > 8 else ''))
+			# ...and, separately, where the taint was actually read.  For an
+			# inline-KASAN target this is nowhere near the reported frame 0 above:
+			# fuse_dev_do_write reports +0x3088 and stores at +0x196c.
+			acc = read['access'] if read else None
+			if acc:
+				note = ('exact' if acc['exact'] else
+						'the access is the call just below it')
+				print(f'[analysis1]   taint read at {acc["pc"]} '
+					  f'[{acc["pc_is"]}, {note}]')
+				if acc['tail_matches_hook_entry'] is False:
+					print(f'[analysis1]   *** WARNING: the stack at the store does '
+						  f'not match the one at hook entry — the store did not '
+						  f'run in the hook caller\'s frame (deeper callee, other '
+						  f'task, or IRQ), so this backtrace mixes two stacks ***')
+			if result['stores_seen'] > 1:
+				print(f'[analysis1]   note: {result["stores_seen"]} stores landed '
+					  f'in the watched range (first {result["first_store_pc"]}, '
+					  f'last {result["last_store_pc"]}); the reading is about the '
+					  f'last one before the probe ran')
+			if read and read['meta'].get('sampled_at'):
+				print(f'[analysis1]   taint sampled with pc='
+					  f'{read["meta"]["sampled_at"][0]} (sampling point, not the '
+					  f'access)')
 			if read and read['meta']['untranslatable']:
 				print(f'[analysis1]   note: {read["meta"]["untranslatable"]}/'
 					  f'{read["meta"]["read"]} bytes were not translatable')
@@ -2192,6 +2332,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			'len': length,
 			'tainted_bytes': tainted,
 			'meta': meta,
+			# No window and no store here, so frame 0 is the reproducer's `call
+			# sink` return address.  Nothing is accessing these bytes when we
+			# sample them — the sink is a program point the reproducer chose.
+			'access': _access_record(meta, []),
 		}
 		_write_analysis()
 		# Same reasoning as a finalised violation: end_analysis() only queues the
