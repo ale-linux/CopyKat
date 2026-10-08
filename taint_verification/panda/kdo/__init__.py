@@ -161,19 +161,29 @@ conf = config
 conf["expect_prompt"] = expect_prompt
 conf["init_code"] = init_code
 
-def update_config(share_path):
+def update_config(share_path, kasan_multi_shot=False):
 	conf["extra_qemu_machine_args"] = (
 		extra_qemu_machine_args
 		+ f" -fsdev local,id=fsdev0,path={share_path},security_model=passthrough"
 		+ " -device virtio-9p-pci,fsdev=fsdev0,mount_tag=hostshare"
 	)
+	if kasan_multi_shot:
+		# Insert kasan_multi_shot into the kernel command line used for the snapshot boot.
+		# The winning binding in rrr/__init__.py drops it, so we patch it back here.
+		# Guard against double-insertion if update_config is called more than once.
+		if "kasan_multi_shot" not in conf["extra_qemu_kernel_args"]:
+			conf["extra_qemu_kernel_args"] = conf["extra_qemu_kernel_args"].replace(
+				"console=ttyS0", "kasan_multi_shot console=ttyS0"
+			)
 	print(f"[kdo] config: share_path={share_path!r}")
+	print(f"[kdo] config: kasan_multi_shot={kasan_multi_shot!r}")
+	print(f"[kdo] config: extra_qemu_kernel_args={conf['extra_qemu_kernel_args']!r}")
 	print(f"[kdo] config: extra_qemu_machine_args={conf['extra_qemu_machine_args']!r}")
 	print(f"[kdo] config: expect_prompt={conf['expect_prompt']!r}")
 	print(f"[kdo] config: ready_serial_signal={conf['ready_serial_signal']!r}")
 	rrr.update_config(conf)
 
-def __record(rootfs, output, timeout, repro_id, skip_rsync=False, earlystop=False):
+def __record(rootfs, output, timeout, repro_id, skip_rsync=False, earlystop=False, kasan_multi_shot=None):
 	record_log_path = 'record.txt'
 	panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
 			extra_args=config["extra_qemu_machine_args"])
@@ -185,7 +195,10 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False, earlystop=Fals
 		nonlocal status
 		ready_re    = re.compile(re.escape(config["ready_serial_signal"]))
 		rsync_re    = re.compile(r'RSYNC_EXIT:(\d+)')
-		sentinel_re = re.compile(config["expect_prompt"])
+		if kasan_multi_shot:
+			sentinel_re = re.compile(r'(?:REPRODUCER DID NOT CRASH|' + re.escape(kasan_multi_shot) + r')')
+		else:
+			sentinel_re = re.compile(config["expect_prompt"])
 		repro_name  = f"{repro_id}/repro"
 
 		print("drive starts")
@@ -333,8 +346,8 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False, earlystop=Fals
 	print(f'__record exits: status={status}')
 	raise SystemExit(status)
 
-def record(kernel, rootfs, timeout, repro_id, output="record", skip_rsync=False, earlystop=False):
-	exitcode = rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id, skip_rsync, earlystop])
+def record(kernel, rootfs, timeout, repro_id, output="record", skip_rsync=False, earlystop=False, kasan_multi_shot=None):
+	exitcode = rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id, skip_rsync, earlystop, kasan_multi_shot])
 	if exitcode is None:
 		return RecordStatus.TIMEOUT
 	if exitcode not in RecordStatus._value2member_map_:

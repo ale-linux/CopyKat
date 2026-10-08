@@ -134,9 +134,19 @@ def main() -> None:
         help='Record only this single repro ID instead of all')
     opts.add_argument('--earlystop', action='store_true', default=False,
         help='Stop the recording 60 seconds after the sentinel is hit instead of waiting for serial silence')
+    opts.add_argument('--kasan-multi-shot', metavar='PATTERN', dest='kasan_multi_shot', default=None,
+        help='Boot the VM with kasan_multi_shot in the kernel cmdline AND wait for PATTERN '
+             'on the serial output before stopping the recording. PATTERN is matched as a '
+             'literal string (not a regex), so characters like +, /, and . are safe to use '
+             'directly — e.g. "hfsc_dequeue+0x502/0x6b0". Supply a string unique to the '
+             'target report so recording waits for that specific KASAN hit rather than the '
+             'first one. "REPRODUCER DID NOT CRASH" is always kept as an alternative so '
+             'clean exits are still detected. NOTE: kasan_multi_shot is added to the kernel '
+             'cmdline only when the VM snapshot is (re)created — delete the existing '
+             'rootfs.qcow2 to force a fresh boot with the new parameter.')
     args = opts.parse_args()
 
-    kdo.update_config(share_path=str(args.share_path))
+    kdo.update_config(share_path=str(args.share_path), kasan_multi_shot=bool(args.kasan_multi_shot))
 
     # Establish and verify the working root.  Everything that follows relies on
     # this as the stable base directory.
@@ -205,7 +215,7 @@ def main() -> None:
         os.chdir(repro_out)
 
         start = time.time()
-        status = kdo.record(kernel, rootfs, 3600*2, repro_id, skip_rsync=args.skip_rsync, earlystop=args.earlystop)
+        status = kdo.record(kernel, rootfs, 3600*2, repro_id, skip_rsync=args.skip_rsync, earlystop=args.earlystop, kasan_multi_shot=args.kasan_multi_shot)
         end = time.time()
         print(f'time: {end - start}')
         repro['time'] = end - start
