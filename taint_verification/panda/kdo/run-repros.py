@@ -132,6 +132,8 @@ def main() -> None:
         help='Skip the rsync step before recording (repros must already be present in the snapshot)')
     opts.add_argument('--repro', metavar='REPRO_ID', default=None,
         help='Record only this single repro ID instead of all')
+    opts.add_argument('--earlystop', action='store_true', default=False,
+        help='Stop the recording 60 seconds after the sentinel is hit instead of waiting for serial silence')
     args = opts.parse_args()
 
     kdo.update_config(share_path=str(args.share_path))
@@ -203,7 +205,7 @@ def main() -> None:
         os.chdir(repro_out)
 
         start = time.time()
-        status = kdo.record(kernel, rootfs, 3600*2, repro_id, skip_rsync=args.skip_rsync)
+        status = kdo.record(kernel, rootfs, 3600*2, repro_id, skip_rsync=args.skip_rsync, earlystop=args.earlystop)
         end = time.time()
         print(f'time: {end - start}')
         repro['time'] = end - start

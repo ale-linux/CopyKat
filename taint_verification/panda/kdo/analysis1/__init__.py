@@ -557,6 +557,47 @@ BUG_CATALOGUE = (
 		'dest':        True,
 		'confirm':     'hook',
 	},
+	{
+		# CONFIG_KASAN_INLINE: the shadow check is open-coded into
+		# __bpf_get_stackid and the only call on the failure path is the report
+		# thunk — same shape as fuse_dev_do_write.  The KASAN report is:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in __bpf_get_stackid+0x93a/0x9e0
+		#
+		# The disassembly around the thunk call:
+		#
+		#   __bpf_get_stackid+0x2349: mov    %rbx,%rdi
+		#   __bpf_get_stackid+0x234c: mov    %rax,0x20(%rsp)
+		#   __bpf_get_stackid+0x2351: call   __asan_report_store8_noabort
+		#   __bpf_get_stackid+0x235c: mov    0x20(%rsp),%rax    <- +0x93a (ret addr)
+		#   __bpf_get_stackid+0x2361: jmp    __bpf_get_stackid+0x962
+		#
+		# The report prints +0x93a, which is the return address of the `call`
+		# the compiler emitted — exactly what callstack_instr exposes as
+		# callers[0] at thunk entry.  The thunk tail-jumps into kasan_report
+		# (the same tail-call pattern as fuse_dev_do_write), so kasan_report
+		# never appears in the call stack and must NOT be used as the hook.
+		#
+		# dest-only: the store writes a computed 8-byte value (rax loaded off the
+		# stack), not a source buffer — same reasoning as fuse_dev_do_write.
+		# The store executes on a stock kernel because __asan_report_store8_noabort
+		# discards its return value, so the instrumented code never vetoes the
+		# store (see "GETTING THE STORE TO EXECUTE").
+		#
+		# ctx='repro': the KASAN report names the process scope (not a kworker).
+		'id':          'bpf_get_stackid',
+		'hook':        '__asan_report_store8_noabort',
+		'args':        'ptr',
+		'access_size': 8,          # the '8' in the hook's name; "Write of size 8"
+		# callers[0] at thunk entry is the return address of the `call` the
+		# compiler emitted, which is precisely what the report prints.
+		'pedigree':    (('frame', 0, ('__bpf_get_stackid',), 0x93a),),
+		'store_fn':    '__bpf_get_stackid',
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
 	# Fallback for the same bug, hooking kasan_report directly.  Usable only on a
 	# kernel where __asan_report_store4_noabort is absent (outline instrumentation)
 	# or where it reaches kasan_report by a real CALL rather than a tail jump.  On
@@ -941,6 +982,10 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	def log(s):
 		if enable_logging:
 			print(s, file=outfile)
+
+	def debug_print(*args, **kwargs):
+		if False:
+			print(*args, **kwargs)
 
 	def _write_analysis():
 		"""Flush the consolidated analysis to ./analysis1.json.
@@ -2147,8 +2192,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			return
 
 		page_base = fault_addr & ~(PAGE_SIZE - 1)
-		print(f'[analysis1] on_ret(handle_mm_fault): cpu{cpu_idx} '
-			  f'fault_addr=0x{fault_addr:x} page_base=0x{page_base:x} — queued')
+		debug_print(f'[analysis1] on_ret(handle_mm_fault): cpu{cpu_idx} '
+					f'fault_addr=0x{fault_addr:x} page_base=0x{page_base:x} — queued')
 		# Queue the raw page base only.  The VMA lookup and heap/anon filter both
 		# read guest memory, so they happen in the on_call drain.
 		pending['zero_pages'].append(page_base)
@@ -2170,22 +2215,22 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					break
 
 			if containing_vma is None:
-				print(f'[analysis1] zero-page drain: 0x{page_base:x} not in any '
-					  f'mapping ({len(pm.mappings)} entries) — skipping')
+				debug_print(f'[analysis1] zero-page drain: 0x{page_base:x} not in any '
+							f'mapping ({len(pm.mappings)} entries) — skipping')
 				continue
 			# Deliberately narrower than ProcessMappings.is_heap(), which also
 			# accepts '[stack]': the stack is written by the process itself and
 			# does not need background labels.
 			if containing_vma['name'] not in ('[heap]', '[anon]'):
-				print(f'[analysis1] zero-page drain: 0x{page_base:x} in vma '
-					  f'{containing_vma["name"]!r} — not heap/anon, skipping')
+				debug_print(f'[analysis1] zero-page drain: 0x{page_base:x} in vma '
+							f'{containing_vma["name"]!r} — not heap/anon, skipping')
 				continue
 
 			enable_taint()
 			first_label = ctr['labels']
-			print(f'[analysis1] zero-page drain: labelling 0x{page_base:x} from '
-				  f'label {first_label} (vma {containing_vma["name"]} '
-				  f'0x{containing_vma["base"]:x}+{containing_vma["size"]})')
+			debug_print(f'[analysis1] zero-page drain: labelling 0x{page_base:x} from '
+						f'label {first_label} (vma {containing_vma["name"]} '
+						f'0x{containing_vma["base"]:x}+{containing_vma["size"]})')
 			untranslatable = 0
 			# Best-effort: find the backtrace of the mmap/brk call that created the
 			# VMA containing this page.  Any key inside the VMA range qualifies —
@@ -2215,12 +2260,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				ctr['labels'] += 1
 			last_label = ctr['labels'] - 1
 			if untranslatable:
-				print(f'[analysis1] zero-page drain: {untranslatable}/{PAGE_SIZE} '
-					  f'bytes untranslatable for 0x{page_base:x}; labels '
-					  f'{first_label}..{last_label}')
+				debug_print(f'[analysis1] zero-page drain: {untranslatable}/{PAGE_SIZE} '
+							f'bytes untranslatable for 0x{page_base:x}; labels '
+							f'{first_label}..{last_label}')
 			else:
-				print(f'[analysis1] zero-page drain: labelled all {PAGE_SIZE} bytes '
-					  f'of 0x{page_base:x} with labels {first_label}..{last_label}')
+				debug_print(f'[analysis1] zero-page drain: labelled all {PAGE_SIZE} bytes '
+							f'of 0x{page_base:x} with labels {first_label}..{last_label}')
 
 	def _on_kdo_store_callback(cpu):
 		"""void kdo_store_callback(int id, void *ptr, int len) — the reproducer
@@ -2271,20 +2316,20 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 		if heap_mapping is None:
 			if containing is None:
-				print(f'[analysis1] kdo_store_callback(id={store_id}, '
-					  f'ptr=0x{ptr:x}, len={length}) — ptr not in any known '
-					  f'mapping ({len(pm.mappings)} entries), skipping taint')
+				debug_print(f'[analysis1] kdo_store_callback(id={store_id}, '
+							f'ptr=0x{ptr:x}, len={length}) — ptr not in any known '
+							f'mapping ({len(pm.mappings)} entries), skipping taint')
 			else:
-				print(f'[analysis1] kdo_store_callback(id={store_id}, '
-					  f'ptr=0x{ptr:x}, len={length}) — ptr in mapping '
-					  f'{containing["name"]!r} 0x{containing["base"]:x}'
-					  f'+{containing["size"]} but not a heap mapping (or the '
-					  f'store does not fit), skipping taint')
+				debug_print(f'[analysis1] kdo_store_callback(id={store_id}, '
+							f'ptr=0x{ptr:x}, len={length}) — ptr in mapping '
+							f'{containing["name"]!r} 0x{containing["base"]:x}'
+							f'+{containing["size"]} but not a heap mapping (or the '
+							f'store does not fit), skipping taint')
 			return
 
-		print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, '
-			  f'len={length}) — in heap mapping 0x{heap_mapping["base"]:x}'
-			  f'+{heap_mapping["size"]}, tainting')
+		debug_print(f'[analysis1] kdo_store_callback(id={store_id}, ptr=0x{ptr:x}, '
+					f'len={length}) — in heap mapping 0x{heap_mapping["base"]:x}'
+					f'+{heap_mapping["size"]}, tainting')
 
 		# All bytes from a single kdo_store_callback call share one label, so the
 		# call site is the unit of taint granularity, not the byte.
@@ -2308,8 +2353,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				untranslatable += 1
 				continue
 			panda.taint_label_ram(taint_paddr, call_label)
-		print(f'[analysis1]   tainted {length - untranslatable}/{length} bytes '
-			  f'with label {call_label}')
+		debug_print(f'[analysis1]   tainted {length - untranslatable}/{length} bytes '
+					f'with label {call_label}')
 
 	def _on_sink(cpu):
 		"""void sink(char *ptr, int len) — reproducer-side check that the labels
@@ -2406,8 +2451,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			# handle_mm_fault(vma, address, flags, regs): arg1=rsi is the address
 			fault_addr = panda.arch.get_arg(cpu, 1)
 			handle_mm_fault_pending[cpu.cpu_index] = fault_addr
-			print(f'[analysis1] on_call(handle_mm_fault): cpu{cpu.cpu_index} '
-				  f'address=0x{fault_addr:x}')
+			debug_print(f'[analysis1] on_call(handle_mm_fault): cpu{cpu.cpu_index} '
+						f'address=0x{fault_addr:x}')
 			return
 
 		if addr == kdo_store_cb_addr:
@@ -2465,7 +2510,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	def on_sys_mmap_enter(cpu, pc, addr_hint, length, prot, flags, fd, offset):
 		if not _in_repro(cpu):
 			return
-		print(
+		debug_print(
 			f'[analysis1] mmap enter: hint=0x{addr_hint:x} len=0x{length:x} '
 			f'prot=0x{prot:x} flags=0x{flags:x} fd={fd} offset=0x{offset:x}'
 		)
@@ -2475,7 +2520,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if not _in_repro(cpu):
 			return
 		ret = panda.arch.get_retval(cpu)
-		print(
+		debug_print(
 			f'[analysis1] mmap return: addr=0x{ret:x} '
 			f'(hint=0x{addr_hint:x} len=0x{length:x} '
 			f'prot=0x{prot:x} flags=0x{flags:x} fd={fd} offset=0x{offset:x})'
@@ -2494,7 +2539,7 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if not _in_repro(cpu):
 			return
 		ret = panda.arch.get_retval(cpu)
-		print(f'[analysis1] brk return: new_brk=0x{ret:x} (requested=0x{brk:x})')
+		debug_print(f'[analysis1] brk return: new_brk=0x{ret:x} (requested=0x{brk:x})')
 		# Record the backtrace keyed by the new-brk pointer.  At drain time we
 		# scan for any key within the heap VMA range, so the exact key value
 		# doesn't have to equal the VMA base.

@@ -173,7 +173,7 @@ def update_config(share_path):
 	print(f"[kdo] config: ready_serial_signal={conf['ready_serial_signal']!r}")
 	rrr.update_config(conf)
 
-def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
+def __record(rootfs, output, timeout, repro_id, skip_rsync=False, earlystop=False):
 	record_log_path = 'record.txt'
 	panda = Panda(arch=config["arch"], mem=config["mem"], expect_prompt=config["expect_prompt"], qcow=rootfs.path,
 			extra_args=config["extra_qemu_machine_args"])
@@ -274,9 +274,17 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 			# OOB store still need to execute in the emulator — that can take many
 			# seconds under PANDA.  Keep draining serial output until we have seen
 			# no new bytes for IDLE_TIMEOUT seconds, then stop.
+			# With --earlystop, a hard 60-second wall-clock deadline from the
+			# moment the sentinel fires is used instead of the open-ended idle drain.
 			if matched and matched != 'REPRODUCER DID NOT CRASH':
 				IDLE_TIMEOUT = 30
-				print(f"[kdo] KASAN sentinel — draining serial (idle timeout={IDLE_TIMEOUT}s)...")
+				EARLYSTOP_TIMEOUT = 60
+				if earlystop:
+					drain_deadline = time.monotonic() + EARLYSTOP_TIMEOUT
+					print(f"[kdo] KASAN sentinel — earlystop mode, hard deadline in {EARLYSTOP_TIMEOUT}s...")
+				else:
+					drain_deadline = None
+					print(f"[kdo] KASAN sentinel — draining serial (idle timeout={IDLE_TIMEOUT}s)...")
 				last_rx = time.monotonic()
 				# _serial_read_until_streaming saves bytes that arrived in the
 				# same recv() call as the sentinel into serial_unconsumed_data.
@@ -288,10 +296,18 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 					panda.serial_unconsumed_data = b''
 					last_rx = time.monotonic()
 				while True:
-					remaining = IDLE_TIMEOUT - (time.monotonic() - last_rx)
+					now = time.monotonic()
+					if drain_deadline is not None and now >= drain_deadline:
+						print(f"[kdo] earlystop: {EARLYSTOP_TIMEOUT}s deadline reached, stopping drain")
+						break
+					if drain_deadline is not None:
+						select_timeout = min(IDLE_TIMEOUT, drain_deadline - now)
+					else:
+						select_timeout = IDLE_TIMEOUT - (now - last_rx)
+					remaining = IDLE_TIMEOUT - (now - last_rx)
 					if remaining <= 0:
 						break
-					r, _, _ = select.select([panda.serial_socket], [], [], remaining)
+					r, _, _ = select.select([panda.serial_socket], [], [], select_timeout)
 					if not r:
 						break
 					data = panda.serial_socket.recv(65535)
@@ -300,7 +316,10 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 					f.write(data)
 					f.flush()
 					last_rx = time.monotonic()
-				print(f"[kdo] post-KASAN serial drain complete (idle {IDLE_TIMEOUT}s)")
+				if earlystop:
+					print(f"[kdo] post-KASAN serial drain complete (earlystop {EARLYSTOP_TIMEOUT}s)")
+				else:
+					print(f"[kdo] post-KASAN serial drain complete (idle {IDLE_TIMEOUT}s)")
 
 		status = RecordStatus.CRASH if matched != 'REPRODUCER DID NOT CRASH' else RecordStatus.NO_CRASH
 		print(f'[kdo] __record: sentinel matched={matched!r}, status={status}')
@@ -314,8 +333,8 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 	print(f'__record exits: status={status}')
 	raise SystemExit(status)
 
-def record(kernel, rootfs, timeout, repro_id, output="record", skip_rsync=False):
-	exitcode = rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id, skip_rsync])
+def record(kernel, rootfs, timeout, repro_id, output="record", skip_rsync=False, earlystop=False):
+	exitcode = rrr.record(kernel, rootfs, timeout, __record, output=output, additional_args=[repro_id, skip_rsync, earlystop])
 	if exitcode is None:
 		return RecordStatus.TIMEOUT
 	if exitcode not in RecordStatus._value2member_map_:

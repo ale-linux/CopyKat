@@ -33,14 +33,16 @@ class ProcessMappings:
     _MTYPE_RANGE_64 = 2
     _MTYPE_ARANGE64 = 3
 
-    def __init__(self, panda, ki):
+    def __init__(self, panda, ki, verbose=False):
         """
         Parameters
         ----------
-        panda : pandare.Panda
-        ki    : dict  –  flat key->int dict from kernelinfo.conf
+        panda   : pandare.Panda
+        ki      : dict  –  flat key->int dict from kernelinfo.conf
+        verbose : bool  –  if False (default) suppress per-refresh log lines
         """
-        self._panda = panda
+        self._panda   = panda
+        self._verbose = verbose
 
         # Maple-tree offsets
         self._MM_MT_OFFSET       = ki['mm.mm_mt_offset']
@@ -111,7 +113,8 @@ class ProcessMappings:
             return
 
         node_addr = self._mt_node_addr(ma_root)
-        print(f'[analysis1] refresh: task=0x{task_addr:x} mm=0x{mm_ptr:x} ma_root=0x{ma_root:x} proc={pname!r}')
+        if self._verbose:
+            print(f'[analysis1] refresh: task=0x{task_addr:x} mm=0x{mm_ptr:x} ma_root=0x{ma_root:x} proc={pname!r}')
 
         # DBG: dump the raw 256-byte maple node so we can see its actual contents
         if self._DBG:
@@ -133,12 +136,13 @@ class ProcessMappings:
         raw_vmas.sort(key=lambda v: v['base'])
 
         self.mappings = raw_vmas
-        print(f'[analysis1] refreshed {len(self.mappings)} mappings for {pname!r}')
-        for m in self.mappings:
-            print(
-                f'[analysis1]   0x{m["base"]:016x}-0x{m["base"]+m["size"]:016x} '
-                f'flags=0x{m["flags"]:x} name={m["name"]!r}'
-            )
+        if self._verbose:
+            print(f'[analysis1] refreshed {len(self.mappings)} mappings for {pname!r}')
+            for m in self.mappings:
+                print(
+                    f'[analysis1]   0x{m["base"]:016x}-0x{m["base"]+m["size"]:016x} '
+                    f'flags=0x{m["flags"]:x} name={m["name"]!r}'
+                )
 
     @staticmethod
     def is_heap(mapping):
