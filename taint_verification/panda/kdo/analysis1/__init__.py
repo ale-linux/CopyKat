@@ -106,6 +106,78 @@ none of it is obvious:
     away.  The watcher is keyed on dst and the after_insn gate is unconditional,
     which is precisely what makes that a non-issue — see "COST".
 
+THE FOURTH SHAPE: THE HELPER TAIL-JUMPS INTO kasan_report  (`confirm: 'print_report'`)
+--------------------------------------------------------------------------------------
+With CONFIG_KASAN_OUTLINE there is no inlined shadow test and no report thunk.
+The compiler emits a plain call to the check helper, which tests the shadow
+itself:
+
+    hfsc_dequeue+0x4fd: call   __asan_store8
+    hfsc_dequeue+0x502: mov    (%rsp),%rax         <- the address the report prints
+    hfsc_dequeue+0x506: mov    %rax,0x138(%r13)    <- the OOB store
+
+That hook is BOTH on the success path and unable to deliver the 'kasan_report'
+signal, which is why neither of the modes above fits it.
+
+  * `confirm: 'hook'` is wrong.  __asan_store8 is called for every 8-byte store at
+    the site and returns normally when the check passes, so a self-confirming
+    entry would promote the first in-bounds one.  Contrast the third shape, where
+    the thunk exists ONLY on the failure path.
+  * `confirm: 'kasan_report'` never fires.  mm/kasan/generic.c defines the helper
+    as a void function that DISCARDS the result of an __always_inline
+    check_region_inline(), so every `return !kasan_report(...)` inside it ends up
+    in tail position and the compiler emits a sibling call:
+
+        __asan_store8+92:  mov    $0x1,%edx
+        __asan_store8+97:  mov    $0x8,%esi
+        __asan_store8+102: jmp    kasan_report        <- not a call
+
+    callstack_instr only pushes a frame for a CALL, so on_call(kasan_report) —
+    the event the confirmation path keys on — never happens.  The report's own
+    backtrace shows the same thing from the other side: kasan_report+0xae sits
+    directly above hfsc_dequeue+0x502 with no __asan_store8 frame between them.
+    This is the hazard the commented-out fuse_dev_do_write_report entry warns
+    about, met for real.
+
+The signal used instead is the call kasan_report makes to print_report(), which
+IS a real call (mm/kasan/report.c runs end_report() and user_access_restore()
+after it, so it cannot be a sibling call).  print_report takes a
+`struct kasan_report_info *`, so the access is not in registers and there is no
+range to test; the discriminator is the CALL STACK instead, and it is the tighter
+of the two.  A pedigree address is a RETURN address, and callstack_instr keeps an
+exact shadow stack rather than the heuristic scan that produces the `?` lines in
+a printed trace — so that address is present only while the call it belongs to is
+still active, i.e. only inside the very hook invocation that opened the window.
+A report raised from another offset in the same function cannot confirm, which is
+what matters most here: this reproducer raises ~20 reports before the interesting
+one, seven of them from other offsets in hfsc_dequeue itself.
+
+Two consequences worth stating plainly:
+
+  * THIS MODE REQUIRES kasan_multi_shot, because print_report sits behind
+    kasan_report's `report_suppressed() || !report_enabled()` gate and the
+    earlier reports would otherwise burn the one-shot bit first.  That is the
+    INVERSE of the constraint in "GETTING THE STORE TO EXECUTE": multi-shot only
+    vetoes a store where the check result is acted on, and a helper that discards
+    it never vetoes anything.  So multi-shot costs this shape nothing and buys it
+    its confirmation — the one place in this module where it is a pure win.
+  * NOTHING NEW ARMS ANYTHING.  on_ret reports the function the CALL entered, so
+    the `ret` that physically sits inside kasan_report still fires
+    on_ret(__asan_store8) and the write watcher goes live there exactly as
+    before.  Confirmation and arming were already decoupled: note_report() only
+    sets a flag and _maybe_finalise() waits for the reading.  The order is window
+    open -> print_report confirms -> on_ret(hook) arms the watcher -> the store
+    lands -> the probe reads taint one instruction later, which is the same
+    destination path the third shape already uses.
+
+Do not be misled by the symbol names.  __asan_store8_noabort is `__alias` of
+__asan_store8, i.e. the CHECK helper; only the __asan_report_ prefix marks the
+failure-path-only thunks of the third shape.  And the variable-width
+__asan_storeN is NOT affected: it tail-jumps to kasan_check_range, which returns
+`!kasan_report(...)` and so must really call it.  That same negation is why every
+pre-existing catalogue entry is fine — __asan_memcpy, memcpy and
+__kasan_check_write all reach kasan_report through kasan_check_range.
+
 PRUNING
 -------
 These helpers are called millions of times per second of guest time.  A hit only
@@ -117,7 +189,9 @@ CONFIRMATION
 ------------
 All of this is about a hook that is also called for in-bounds accesses, i.e.
 `confirm: 'kasan_report'`.  A hook that only exists on the failure path confirms
-itself and skips the whole dance — see "THE THIRD SHAPE" above.
+itself and skips the whole dance — see "THE THIRD SHAPE" above.  A hook that is
+on the success path but whose failure path tail-jumps past on_call(kasan_report)
+needs the same window machinery with a different signal — see "THE FOURTH SHAPE".
 
 A matching call stack is necessary but not sufficient: the same call site is hit
 many times and only one of those calls is the out-of-bounds one.  kasan_report()
@@ -449,6 +523,14 @@ def process_name(panda, cpu):
 #                        pedigree match IS the confirmation and the window is
 #                        confirmed at entry from the hook's own arguments.  See
 #                        "THE THIRD SHAPE" in the module docstring.
+#               'print_report'  for a hook that TAIL-JUMPS into kasan_report, so
+#                        no on_call(kasan_report) ever fires and 'kasan_report'
+#                        would never confirm — while still being on the success
+#                        path, so 'hook' would confirm everything.  Waits instead
+#                        for the call to print_report() that kasan_report makes,
+#                        and matches on the CALL STACK rather than on a reported
+#                        range.  Requires kasan_multi_shot.  See "THE FOURTH
+#                        SHAPE" in the module docstring.
 #
 # `source` and `dest` are independent; a catalogue entry may set both.  Setting
 # `dest` on an entry whose store happens *inside* the hooked function (case 1)
@@ -597,6 +679,69 @@ BUG_CATALOGUE = (
 		'source':      False,
 		'dest':        True,
 		'confirm':     'hook',
+	},
+	{
+		# CONFIG_KASAN_OUTLINE: the shadow check is NOT open-coded, so the
+		# compiler emits a plain `call __asan_store8` for the access and that
+		# helper does the check itself.  The report is:
+		#
+		#     BUG: KASAN: use-after-free in hfsc_dequeue+0x502/0x6b0
+		#     Write of size 8 at addr ffff88800a9b0140 by task repro/161
+		#
+		# The disassembly around the call:
+		#
+		#   hfsc_dequeue+0x4f6: jae    hfsc_dequeue+0x50d     ; in-bounds path
+		#   hfsc_dequeue+0x4f8: mov    0x8(%rsp),%rdi
+		#   hfsc_dequeue+0x4fd: call   __asan_store8
+		#   hfsc_dequeue+0x502: mov    (%rsp),%rax             <- +0x502 (ret addr)
+		#   hfsc_dequeue+0x506: mov    %rax,0x138(%r13)        <- THE OOB STORE
+		#
+		# dest-only: the stored value is loaded off the stack, not copied from a
+		# source buffer — same reasoning as fuse_dev_do_write and bpf_get_stackid.
+		# The store executes on a stock kernel because __asan_store8 returns void
+		# and DISCARDS the check result (DEFINE_ASAN_LOAD_STORE in
+		# mm/kasan/generic.c), so the instrumented code has nothing to veto on.
+		#
+		# confirm='print_report' is the whole reason that mode exists; this is the
+		# first catalogue entry whose hook is a check helper rather than a report
+		# thunk.  Neither older mode works:
+		#   * 'kasan_report' never fires.  Discarding the result puts every
+		#     `return !kasan_report(...)` of the inlined check_region_inline() in
+		#     tail position, so __asan_store8 ends in `jmp kasan_report` (+102)
+		#     rather than a call, and callstack_instr only pushes a frame for a
+		#     CALL.  This is also why the report's own backtrace shows
+		#     kasan_report+0xae directly above hfsc_dequeue+0x502 with no
+		#     __asan_store8 frame between them.
+		#   * 'hook' would confirm everything.  __asan_store8 is called for EVERY
+		#     8-byte store at this site and returns normally when the check passes
+		#     (the three `jmp __x86_return_thunk` exits at +63/+111/+132), and
+		#     hfsc_dequeue+0x4fd is an ordinary conditional field update that runs
+		#     constantly on live classes.
+		# Do not be misled by the name: __asan_store8_noabort is __alias of
+		# __asan_store8, i.e. the CHECK helper.  Only the __asan_report_ prefix
+		# marks the failure-path-only thunks the two entries above hook.
+		#
+		# REQUIRES kasan_multi_shot, because print_report() sits behind
+		# kasan_report's `report_suppressed() || !report_enabled()` gate and this
+		# reproducer raises ~20 earlier reports that would otherwise burn the
+		# one-shot bit before this one.  That is the exact inverse of the mem*()
+		# constraint in "GETTING THE STORE TO EXECUTE": multi-shot only vetoes a
+		# store where the check result is ACTED ON, and here it is discarded, so
+		# multi-shot costs this entry nothing and buys it its confirmation.
+		'id':          'hfsc_dequeue',
+		'hook':        '__asan_store8',
+		'args':        'ptr',
+		'access_size': 8,          # the '8' in the hook's name; "Write of size 8"
+		# callers[0] at __asan_store8 entry is the return address of the `call`
+		# hfsc_dequeue made, which is what the report prints.  The same address is
+		# what the confirmation matches on in print_report's call stack, where the
+		# tail jump leaves it one frame deeper (below kasan_report+0xae).
+		'pedigree':    (('frame', 0, ('hfsc_dequeue',), 0x502),),
+		'store_fn':    'hfsc_dequeue',
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'print_report',
 	},
 	# Fallback for the same bug, hooking kasan_report directly.  Usable only on a
 	# kernel where __asan_report_store4_noabort is absent (outline instrumentation)
@@ -840,8 +985,20 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	kdo_store_cb_addr    = _usym('kdo_store_callback')
 	sink_addr            = _usym('sink')
 
+	# confirm='print_report' only.  print_report() is `static` in mm/kasan/report.c,
+	# which is fine — rrr runs plain `nm`, so local ('t') symbols are in
+	# symbol_map alongside the global ones.  Being static does mean the compiler
+	# may rename it, hence the alternate spellings; if a future kernel inlines it
+	# into kasan_report altogether, switch to start_report/end_report, which are
+	# called from the same place and under the same gate.
+	print_report_addr, print_report_sym = _first_ksym(
+			('print_report', 'print_report.constprop.0', 'print_report.isra.0'))
+
 	print(f'[analysis1] kasan_report:    '
 		  f'{hex(kasan_report_addr) if kasan_report_addr else "NOT FOUND"}')
+	print(f'[analysis1] print_report:    '
+		  f'{hex(print_report_addr) if print_report_addr else "NOT FOUND"}'
+		  f' ({print_report_sym})')
 	print(f'[analysis1] panic:           '
 		  f'{hex(panic_addr) if panic_addr else "NOT FOUND"}')
 	print(f'[analysis1] handle_mm_fault: '
@@ -852,8 +1009,15 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		  f'{hex(sink_addr) if sink_addr else "NOT FOUND"}')
 
 	if kasan_report_addr is None:
-		print('[analysis1] WARNING: kasan_report not in the symbol table — no '
-			  'observation can ever be confirmed as out of bounds')
+		# Only confirm='kasan_report' needs it.  A 'hook' target is confirmed from
+		# its own arguments and a 'print_report' target keys on a different call,
+		# so neither is affected — scope the warning to the entries that are, or
+		# it reads as fatal on a kernel where nothing needed the symbol.
+		_needs = [t['id'] for t in BUG_CATALOGUE
+				  if t['confirm'] == 'kasan_report']
+		print('[analysis1] WARNING: kasan_report not in the symbol table — '
+			  f'no observation from {_needs} can ever be confirmed as out of '
+			  'bounds (other confirm modes are unaffected)')
 
 	def _resolve_target(t):
 		"""Turn a catalogue entry into a runtime target, or None if a symbol is
@@ -869,8 +1033,19 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		# Catalogue self-consistency.  Reported the same way as a missing symbol so
 		# that a malformed entry disables its own target and says why, rather than
 		# raising out of a callback in the middle of a replay.
-		if t['confirm'] not in ('kasan_report', 'hook'):
+		if t['confirm'] not in ('kasan_report', 'hook', 'print_report'):
 			return None, f"unknown confirm mode {t['confirm']!r}"
+		if t['confirm'] == 'print_report' and print_report_addr is None:
+			# Disable just this entry rather than warning globally: the other
+			# confirm modes do not need the symbol, so a kernel without it is
+			# only a problem for the targets that asked for it.
+			return None, "confirm 'print_report' needs print_report, not found"
+		if t['confirm'] == 'print_report' and not any(
+				c[0] == 'frame' for c in t['pedigree']):
+			# The confirmation matches the pedigree addresses against
+			# print_report's call stack, so there has to be at least one.  An
+			# entry with no pedigree at all would confirm on any printed report.
+			return None, "confirm 'print_report' needs at least one pedigree frame"
 		if t['args'] == 'ptr' and not t.get('access_size'):
 			return None, "args 'ptr' needs a positive access_size"
 
@@ -951,9 +1126,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# OSI-based process check stay off the hot path: on_call is invoked for every
 	# call instruction in the guest.
 	interesting_call_addrs = {a for a in (
-		kasan_report_addr, kdo_store_cb_addr, sink_addr, panic_addr,
-		handle_mm_fault_addr,
+		kasan_report_addr, print_report_addr, kdo_store_cb_addr, sink_addr,
+		panic_addr, handle_mm_fault_addr,
 	) if a is not None}
+
+	# Only pay for the print_report branch in on_call when an enabled target
+	# actually asked for it; otherwise the address stays out of the dispatch.
+	want_print_report = any(t['confirm'] == 'print_report' for t in targets)
 
 	# ------------------------------------------------------------------
 	# Analysis state
@@ -965,8 +1144,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 	# Counters are in a dict so nested callbacks can bump them without `nonlocal`
 	# gymnastics.  Hook counters count ALL calls in ALL tasks — they exist to say
 	# how much noise the pedigree filter is removing, so they must not be gated.
-	ctr = {'hook_calls': {}, 'target_hits': {}, 'kasan_report': 0, 'labels': 1,
-		   'store_id_calls': {}}
+	ctr = {'hook_calls': {}, 'target_hits': {}, 'kasan_report': 0,
+		   'print_report': 0, 'labels': 1, 'store_id_calls': {}}
 	# Set once the answer is in and panda.end_analysis() has been queued.  The
 	# stop is asynchronous (queue_async(stop_run)) so hooks keep firing for a
 	# while; and panda.ending makes pandare's enable_callback() a silent no-op
@@ -1004,6 +1183,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			'hook_calls':   dict(ctr['hook_calls']),
 			'target_hits':  dict(ctr['target_hits']),
 			'kasan_report': ctr['kasan_report'],
+			# Printed reports seen by confirm='print_report'.  Worth having next
+			# to kasan_report: on a kernel whose helpers tail-jump, the first is
+			# 0 while the second is not, which is the signature of "the hook
+			# never produced an on_call(kasan_report)".
+			'print_report': ctr['print_report'],
 		}
 		analysis['total_taint_labels'] = ctr['labels'] - 1
 		analysis['process_mappings'] = len(pm.mappings)
@@ -1647,22 +1831,32 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		def note_report(self, cpu, report):
 			"""The access really is out of bounds.
 
-			Either kasan_report() ran while this window was open and named an
-			access this window is about (confirm='kasan_report'), or the hook is
-			itself on KASAN's failure path and _on_hook_call synthesised the record
-			from its arguments (confirm='hook', report['via'] == 'hook')."""
+			One of three things happened: kasan_report() ran while this window was
+			open and named an access this window is about (confirm='kasan_report');
+			the hook is itself on KASAN's failure path and _on_hook_call
+			synthesised the record from its arguments (confirm='hook',
+			report['via'] == 'hook'); or kasan_report tail-jumped past our reach
+			and _on_print_report matched its call stack instead
+			(confirm='print_report', report['via'] == 'print_report')."""
 			if self.confirmed or self.closed:
 				return
 			self.report = report
-			self.report_exact = (report['addr'] == self.dst
-								 and report['size'] == self.req_size)
+			# A stack-matched confirmation carries no independently observed range
+			# — _on_print_report fills addr/size in from this window — so there is
+			# nothing to compare and 'exact' is None rather than a tautological
+			# True.  What stands in for the range test there is the call stack:
+			# see _on_print_report.
+			self.report_exact = (None if report.get('via') == 'print_report' else
+								 (report['addr'] == self.dst
+								  and report['size'] == self.req_size))
 			self.confirmed = True
-			what = ('reaching ' + self.target['hook'] if report.get('via') == 'hook'
-					else 'kasan_report')
+			what = {'hook':         'reaching ' + self.target['hook'],
+					'print_report': 'print_report'}.get(report.get('via'),
+													    'kasan_report')
 			print(f'[analysis1] {what} confirms window #{self.hit} '
 				  f'({self.target["id"]}) — write of size {report["size"]} at '
 				  f'0x{report["addr"]:x}, ip=0x{report["ip"]:x}'
-				  + ('' if self.report_exact else
+				  + ('' if self.report_exact is not False else
 					 f' (NB does not exactly match the captured '
 					 f'0x{self.dst:x}+{self.req_size})'))
 			# Source targets read here rather than at hook entry — see capture().
@@ -1834,8 +2028,16 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 					  f'{read["meta"]["read"]} {read["kind"]} bytes at '
 					  f'{read["base"]} carry taint ***')
 			elif outcome == 'unconfirmed':
-				print(f'[analysis1] ({tag}) call stack matched but kasan_report did '
-					  f'not fire — this call was in bounds, not the reported one '
+				# Name the signal this target actually waits for.  'kasan_report' is
+				# only one of them, and for a confirm='print_report' target it is
+				# precisely the signal that CANNOT arrive — the hook tail-jumps past
+				# it — so "kasan_report did not fire" reads there like a fault when it
+				# is the expected state of every in-bounds hit.
+				waited_for = ('no printed report named this call site'
+							  if self.target['confirm'] == 'print_report' else
+							  'kasan_report did not fire')
+				print(f'[analysis1] ({tag}) call stack matched but {waited_for} '
+					  f'— this call was in bounds, not the reported one '
 					  f'[{result["reason"]}]')
 			elif outcome == 'store_never_executed':
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): no write to '
@@ -2139,6 +2341,74 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				continue
 			w.note_report(cpu, report)
 
+	def _on_print_report(cpu):
+		"""kasan_report() is about to PRINT a report — the confirmation signal for
+		a hook that tail-jumps into kasan_report and so never produces an
+		on_call(kasan_report).  See "THE FOURTH SHAPE" in the module docstring.
+
+		Matching is on the CALL STACK, not on a reported range, because
+		print_report(struct kasan_report_info *) carries the access in a struct
+		rather than in registers.  That is not a weaker test but a tighter one: a
+		pedigree address is a RETURN address, and callstack_instr keeps an exact
+		shadow stack, so it is present here only while the call it belongs to is
+		still active — i.e. only inside the very hook invocation that opened the
+		window.  A report raised from a different call site in the same function
+		therefore cannot confirm, which is exactly what the range test buys for
+		'kasan_report' and what matters most under kasan_multi_shot, where this
+		reproducer raises ~20 other reports (several from other offsets in
+		hfsc_dequeue itself).
+
+		The addresses are checked without regard to index.  The tail jump leaves
+		the hook with no frame of its own, so a pedigree frame sits one deeper
+		here than it did at hook entry (below kasan_report's own return address) —
+		but how much deeper depends on the shape of the failure path, and an
+		exact-index test would be a hardcoded guess at it.  Presence is sound on
+		its own, per the paragraph above.
+
+		NB this only fires when the report is actually printed: print_report sits
+		behind kasan_report's `report_suppressed() || !report_enabled()` gate.
+		Hence the kasan_multi_shot requirement on every target using this mode."""
+		ctr['print_report'] += 1
+
+		stack = callers(cpu)
+		print(f'[analysis1] print_report: '
+			  f'{len(stack)} frame(s), innermost first: '
+			  + ' '.join(f'[{i}]=0x{a:x}' for i, a in enumerate(stack[:8]))
+			  + (' ...' if len(stack) > 8 else ''))
+
+		for w in list(state['windows']):
+			if w.closed or w.confirmed:
+				continue
+			if w.target['confirm'] != 'print_report':
+				continue
+			# Integer comparisons first, OSI walk second — same ordering rule as
+			# _on_hook_call.  A window whose pedigree is absent from this stack is
+			# rejected without touching guest memory.
+			missing = [desc for _kind, _idx, addr, desc in w.target['pedigree']
+					   if addr not in stack]
+			if missing:
+				print(f'[analysis1]   not about window #{w.hit} '
+					  f'({w.target["id"]}): {", ".join(missing)} not on this '
+					  f'stack — not confirming')
+				continue
+			if not w.same_ctx(cpu):
+				print(f'[analysis1]   not the {w.armed_by!r} that opened window '
+					  f'#{w.hit} ({w.target["id"]}) — not confirming')
+				continue
+			# The access is the one this window captured at hook entry: the
+			# pedigree match above establishes that the report being printed is
+			# about that very call.  Recorded in the same four fields a real
+			# kasan_report would have given, with via='print_report' so the JSON
+			# never claims these came off the report's own arguments.
+			w.note_report(cpu, {
+				'addr':     w.dst,
+				'size':     w.req_size,
+				'is_write': True,
+				'ip':       int(w.entry['backtrace'][0], 16)
+							if w.entry['backtrace'] else 0,
+				'via':      'print_report',
+			})
+
 	# ------------------------------------------------------------------
 	# callstack_instr hooks
 	# ------------------------------------------------------------------
@@ -2413,6 +2683,16 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		if addr == kasan_report_addr:
 			_on_kasan_report(cpu)
 			return
+
+		# 2b. The same signal for a hook that tail-jumps into kasan_report, where
+		#     the call above never happens.  Deliberately a separate branch rather
+		#     than a fallback inside _on_kasan_report: on a kernel where BOTH
+		#     paths exist (an outline helper and a real call elsewhere) the two
+		#     fire independently, and note_report's own guard keeps whichever
+		#     arrives first.
+		if want_print_report and addr == print_report_addr:
+			_on_print_report(cpu)
+			return
 		if tlist is not None:
 			return
 
@@ -2585,6 +2865,11 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 			print(f'[analysis1] {tid}: {hits} pedigree-matching hit(s), '
 				  f'outcomes={[o["outcome"] for o in obs]}')
 		print(f'[analysis1] kasan_report calls: {ctr["kasan_report"]}')
+		if want_print_report:
+			# Only meaningful when a target asked for it, and then it is the first
+			# thing to look at: 0 printed reports with a nonzero hook count means
+			# the reports were suppressed, i.e. the run needs kasan_multi_shot.
+			print(f'[analysis1] print_report calls: {ctr["print_report"]}')
 		print(f'[analysis1] OOB writes confirmed tainted: '
 			  f'{sum(1 for o in analysis.get("observations", []) if o["outcome"] == "tainted")}'
 			  f'/{len(analysis.get("observations", []))} observation(s)')
