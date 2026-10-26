@@ -346,16 +346,52 @@ class Kernel:
             print(f"path.mnt_parent_offset = {mnt_parent_offset - mnt_offset}",file=info_file)
             print(f"path.mnt_mountpoint_offset = {mnt_mountpoint_offset - mnt_offset}",file=info_file)
 
-            # Offsets that no longer exist in 6.1+ kernels (maple tree replaced
-            # the mmap linked list); osi_linux reads these as OPTIONAL so -1 is safe.
-            print("mm.mmap_offset = -1",file=info_file)
-            print("vma.vm_next_offset = -1",file=info_file)
+            # WHICH VMA CONTAINER DOES THIS KERNEL HAVE?
+            #
+            # Linux 6.1 (763ecb03502a, "mm: remove the vma linked list") replaced
+            # mm_struct->mmap / vm_area_struct->vm_next with a maple tree in
+            # mm_struct->mm_mt.  Ask gdb which one exists rather than assuming:
+            # gdb prints nothing for a field that is not in the struct, so an
+            # empty answer IS the version test, taken against the very vmlinux
+            # being replayed.
+            #
+            # These were previously hardcoded to -1 with the note that they "no
+            # longer exist in 6.1+ kernels" — true, but it left a pre-6.1 kernel
+            # with NEITHER container described, and analysis1's VMA walker then
+            # died with a bare KeyError('mm.mm_mt_offset').  osi_linux reads both
+            # as OPTIONAL, so -1 is safe where the field really is absent; what
+            # is not safe is -1 where it is present and is the only way to walk
+            # the list.
+            mm_mt_offset = gdb_printf("%d", "(int)&((struct mm_struct*)0)->mm_mt")
+            if mm_mt_offset:
+                # 6.1+: no mmap list.  The maple offsets are emitted below.
+                print("mm.mmap_offset = -1",file=info_file)
+                print("vma.vm_next_offset = -1",file=info_file)
+            else:
+                # Pre-6.1: emit the real list offsets.  This is what both
+                # osi_linux's native get_mappings (get_vma_first/get_vma_next)
+                # and analysis1's ProcessMappings list walk need.
+                mmap_offset = gdb_printf("%d", "(int)&((struct mm_struct*)0)->mmap")
+                vm_next_offset = gdb_printf("%d", "(int)&((struct vm_area_struct*)0)->vm_next")
+                print(f"mm.mmap_offset = {mmap_offset or -1}",file=info_file)
+                print(f"vma.vm_next_offset = {vm_next_offset or -1}",file=info_file)
+                if not mmap_offset or not vm_next_offset:
+                    log("WARNING: this kernel has neither mm_mt nor a readable "
+                        "mmap/vm_next pair — no VMA walk will work. Got "
+                        f"mmap={mmap_offset!r} vm_next={vm_next_offset!r}")
 
             # Fields marked -1 are absent in newer kernels; osi_linux treats -1
             # as "not present" and skips them gracefully.
+            #
+            # mm_struct->mm_mt is the mirror case: absent in OLDER kernels
+            # (pre-6.1).  It has to be listed, or the loop below emits a literal
+            # `mm.mm_mt_offset = ` with an empty value — which analysis1's
+            # _load_kernelinfo then drops, turning "this kernel has no maple
+            # tree" into a missing key rather than an explicit -1.
             optional_fields = {
                 "task_struct": {"thread_group", "d_iname"},
                 "dentry": {"d_iname"},
+                "mm_struct": {"mm_mt"},
             }
             # Some fields were renamed in newer kernels; try these alternatives
             # before falling back to -1.
@@ -418,9 +454,15 @@ class Kernel:
                 "ma64.meta_offset":           ("(int)&((struct maple_arange_64*)0)->meta",),
                 "ma64.num_slots":             ("(int)(sizeof(((struct maple_arange_64*)0)->slot)/sizeof(void*))",),
             }
+            # Only meaningful on a kernel that HAS a maple tree; on pre-6.1 every
+            # one of these queries names a struct that does not exist and gdb
+            # returns an empty string, so emit an explicit -1 instead of a key
+            # with no value.  ProcessMappings._detect_era() reads -1 and absent
+            # identically, so either spelling selects the list walk — but -1 says
+            # "asked, not there" rather than "never asked".
             for key, (expr,) in maple_offsets.items():
-                val = gdb_printf("%d", expr)
-                print(f"maple.{key} = {val}", file=info_file)
+                val = gdb_printf("%d", expr) if mm_mt_offset else ""
+                print(f"maple.{key} = {val or -1}", file=info_file)
 
             gdbmi.exit()
             info_file.close()

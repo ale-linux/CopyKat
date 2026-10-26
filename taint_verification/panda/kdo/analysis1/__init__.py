@@ -359,7 +359,8 @@ memcpy() takes that decision itself.  What is left:
      Do NOT add kasan_multi_shot if you are relying on this: it keeps every report
      enabled and therefore vetoes every copy.
   2. Read the SOURCE instead, and never depend on the store.  THIS IS WHAT THE
-     p9_read_work ENTRY DOES, and it is the right default wherever the source is
+     p9_read_work AND ext4_write_inline_data ENTRIES DO, and it is the right
+     default wherever the source is
      reachable.  The report's faulting frame is a `call memcpy`, so hooking memcpy
      itself hands you (dest, src, len) in rdi/rsi/rdx and the taint on the bytes
      about to go out of bounds is readable before anything stores.  Works on the
@@ -607,6 +608,81 @@ BUG_CATALOGUE = (
 		'confirm':  'kasan_report',
 	},
 	{
+		# The same shape as p9_read_work above — an OOB memcpy whose source is in
+		# registers at hook entry — reached through ext4's inline-data path:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in ext4_write_inline_data+0x30a/0x3d0
+		#     Write of size 70 at addr ffff888000fef4ef by task repro/4800
+		#     kasan_check_range+0x140/0x190
+		#     memcpy+0x39/0x60
+		#     ext4_write_inline_data+0x30a/0x3d0
+		#     ext4_write_inline_data_end+0x24c/0x6b0
+		#
+		# Every offset in that report is mechanically reproducible, which is worth
+		# recording because it is what makes this entry derivable from the text:
+		#   ext4_write_inline_data+0x305: call memcpy   -> returns to +0x30a = frame 0
+		#   memcpy+0x34:  je   memcpy+0x50              ; src check failed
+		#   memcpy+0x39 is the return address of the SECOND kasan_check_range (the
+		#   one at +0x34 with $0x1,%edx, i.e. the DESTINATION check); the first, at
+		#   +0x1b with %edx zeroed, checks src and PASSED — reaching the second is
+		#   the proof of that.  So the confirming report is about dest, and
+		#   report_matches' range test would reject a src-range report anyway.
+		#   kasan_check_range+0x13b: call kasan_report  -> returns to +0x140
+		#
+		# That last one is a REAL call, not a tail jump, so confirm='kasan_report'
+		# fires here: kasan_check_range returns `!kasan_report(...)` and the
+		# negation forces the call to be non-sibling.  See the note at the end of
+		# "THE FOURTH SHAPE" about why every kasan_check_range reacher is safe.
+		#
+		# source-only, and the disassembly says why the destination is not an
+		# option.  memcpy ACTS on the dest check's result:
+		#   memcpy+0x39: test %al,%al
+		#   memcpy+0x3b: je   memcpy+0x50     -> xor %eax,%eax; ret   (returns NULL)
+		#   memcpy+0x4b: jmp  __memcpy                                (the copy)
+		# so the occurrence whose report is PRINTED never reaches __memcpy and there
+		# is no store to watch — the exact case in "GETTING THE STORE TO EXECUTE".
+		# Reading src is not a workaround for that but the same answer, because the
+		# copy is verbatim and taint2 propagates labels byte-for-byte.
+		#
+		# The source is where the interesting dataflow already is: src is a
+		# page-cache page that generic_perform_write filled via copy_from_user from
+		# the reproducer's own buffer, so labels planted by kdo_store_callback reach
+		# it as repro heap -> write(2) -> page cache -> this memcpy.
+		'id':       'ext4_write_inline_data',
+		'hook':     'memcpy',
+		'args':     'memcpy',
+		# Frame 0 alone is enough pruning, unlike p9_read_work, which needed an
+		# 'anywhere' because its _copy_to_iter+0x997 matches every pipe/socket read
+		# through that call site.  ext4_write_inline_data+0x30a is one call site on
+		# the inline-data write path, so it is already specific.
+		# ext4_write_inline_data_end+0x24c is on the stack (the report prints it
+		# without a '?', so ORC resolved it from a real frame) and can be added as
+		# an 'anywhere' if this ever turns out to need more.
+		#
+		# NB adding a second target on the `memcpy` hook widens hook_prefilter
+		# rather than breaking it: both targets constrain frame 0, so the prefilter
+		# stays a depth-1 query and its test is an OR over targets.
+		#
+		# ext4_write_inline_data is static in fs/ext4/inline.c, which is fine —
+		# rrr runs plain `nm`, so local ('t') symbols are in symbol_map too.  The
+		# alternate spellings cover a build where the compiler adds a suffix; the
+		# bare name is tried first and is what the report prints.
+		'pedigree': (('frame', 0, ('ext4_write_inline_data',
+								   'ext4_write_inline_data.constprop.0',
+								   'ext4_write_inline_data.isra.0'), 0x30a),),
+		# hook == store_fn == memcpy, so the window spans exactly one call and the
+		# confirming report can only be the one that call raised — same reasoning as
+		# p9_read_work.  The ordering also falls out: kasan_report runs INSIDE
+		# memcpy, so the window is confirmed, the source read taken and the
+		# observation finalised before on_ret(memcpy) arrives to close it.
+		'store_fn': 'memcpy',
+		# "by task repro/4800" — the process scope, not a kworker.
+		'ctx':      'repro',
+		'source':   True,
+		'dest':     False,
+		'confirm':  'kasan_report',
+	},
+	{
 		# CONFIG_KASAN_INLINE: the shadow check is open-coded into
 		# fuse_dev_do_write and the only call left on the failure path is the
 		# report thunk, so the report has no KASAN-helper frame to hook —
@@ -675,6 +751,80 @@ BUG_CATALOGUE = (
 		# compiler emitted, which is precisely what the report prints.
 		'pedigree':    (('frame', 0, ('__bpf_get_stackid',), 0x93a),),
 		'store_fn':    '__bpf_get_stackid',
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	{
+		# CONFIG_KASAN_INLINE again — the third instance of "THE THIRD SHAPE",
+		# this time a ONE-BYTE store.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in hfs_asc2mac+0x690/0x720
+		#     Write of size 1 at addr ffff88802168fb4e by task repro/2897
+		#     kasan_report+0xbf/0x1f0
+		#     hfs_asc2mac+0x690/0x720
+		#     hfs_cat_build_key+0xc4/0x170
+		#     hfs_lookup+0x1ca/0x310
+		#
+		# The disassembly around the report call (gdb prints its <sym+N> labels in
+		# DECIMAL, so the offsets below are the hex ones the report uses):
+		#
+		#   hfs_asc2mac+0x67f: jmp    hfs_asc2mac+0x227   ; in-bounds path rejoins
+		#   hfs_asc2mac+0x684: mov    %rbx,%rdi           ; the OOB address
+		#   hfs_asc2mac+0x687: mov    %rcx,(%rsp)         ; spill across the call
+		#   hfs_asc2mac+0x68b: call   __asan_report_store1_noabort
+		#   hfs_asc2mac+0x690: mov    (%rsp),%rcx         <- +0x690 (ret addr)
+		#
+		# 0x68b + 5 (call rel32) = 0x690, i.e. the offset the report prints is the
+		# RETURN ADDRESS of that call, which is exactly what callstack_instr gives
+		# as callers[0] at thunk entry — hence ('frame', 0, ..., 0x690).  The
+		# report's own backtrace corroborates the tail jump the third shape is
+		# about: kasan_report+0xbf sits directly above hfs_asc2mac+0x690 with no
+		# __asan_report_store1_noabort frame between them, so on_call(kasan_report)
+		# never fires and kasan_report must NOT be the hook.
+		#
+		# confirm='hook': the thunk exists ONLY on the failure path, so reaching it
+		# IS the report and the window is confirmed at entry from rdi + the width in
+		# the symbol's name.  No kasan_multi_shot needed, and the store executes on a
+		# stock kernel because the thunk returns void and the instrumented code acts
+		# on nothing (see "GETTING THE STORE TO EXECUTE").
+		#
+		# dest-only, and here for a different reason than the entries above: there IS
+		# a source — hfs_asc2mac is a charset conversion whose input is the qstr from
+		# hfs_cat_build_key — but the store is a CONVERTED byte, not a copied one, so
+		# taint2 reaches it through taint_mix rather than a byte-for-byte taint_copy
+		# and a source reading would not be the same answer.  The thunk is handed
+		# only the destination anyway, which is the case the note under "Two shapes"
+		# reserves for the destination probe.
+		#
+		# access_size 1 is the smallest a catalogue entry has used; nothing special
+		# follows from it — watch_size becomes 1, the watcher's overlap test and the
+		# probe's taint read are per byte already.  The store that lands may be WIDER
+		# than 1 byte (the compiler stores a whole converted character while KASAN
+		# flagged only its first byte); overlap, not containment, is what the watcher
+		# tests, so that arms correctly and the reading stays scoped to the byte the
+		# report is about.
+		#
+		# hfs_asc2mac converts a name one character at a time, so a name that runs
+		# off the end can reach this thunk REPEATEDLY, once per out-of-bounds byte,
+		# each with a different rdi.  Each hit supersedes the previous window by the
+		# same-target rule in _on_hook_call, and because confirmation is immediate
+		# here the superseded one has normally already finalised with its reading —
+		# so the first OOB byte is the verdict and the rest are recorded as further
+		# observations (or stop the run, under stop_on_first_violation).
+		'id':          'hfs_asc2mac',
+		'hook':        '__asan_report_store1_noabort',
+		'args':        'ptr',
+		'access_size': 1,          # the '1' in the hook's name; "Write of size 1"
+		# One instruction in a cold report block is already unique, and the thunk is
+		# ice cold — only ever reached on a failed check — so frame 0 alone is enough
+		# and hfs_cat_build_key+0xc4 / hfs_lookup+0x1ca are left unenforced.
+		'pedigree':    (('frame', 0, ('hfs_asc2mac',), 0x690),),
+		# The store lands back on the hot path inside hfs_asc2mac itself (the cold
+		# block jumps back), well before it returns to hfs_cat_build_key.
+		'store_fn':    'hfs_asc2mac',
+		# "by task repro/2897" — the process scope, not a kworker.
 		'ctx':         'repro',
 		'source':      False,
 		'dest':        True,
@@ -882,8 +1032,21 @@ def _hexdump(data, tainted=frozenset(), missing=frozenset(), width=16):
 
 
 def _load_kernelinfo(path):
-	"""Parse a kernelinfo.conf and return a flat dict of key -> int."""
+	"""Parse a kernelinfo.conf and return a flat dict of key -> int.
+
+	Non-integer values are skipped: the file carries strings like `name = Linux`
+	alongside the offsets.  An EMPTY value is skipped too but also WARNED about,
+	because it means something different and much more interesting — rrr asks gdb
+	for `&((struct X*)0)->field` and gdb prints nothing when the field does not
+	exist in that kernel, so `key = ` is how "this kernel has no such field"
+	reaches us.  Dropping those silently is how a 5.14 replay got as far as a bare
+	KeyError('mm.mm_mt_offset') from the VMA walker: the maple tree does not exist
+	before 6.1, so all 14 maple keys were empty and all 14 vanished here.
+	ProcessMappings now picks its walk from which keys are present, so an absent
+	key is expected rather than fatal — but it still has to be VISIBLE, since the
+	same silence would hide a genuinely broken kernelinfo."""
 	ki = {}
+	empty = []
 	with open(path) as f:
 		for line in f:
 			line = line.strip()
@@ -892,10 +1055,17 @@ def _load_kernelinfo(path):
 			if '=' not in line:
 				continue
 			key, _, val = line.partition('=')
+			key, val = key.strip(), val.strip()
+			if not val:
+				empty.append(key)
+				continue
 			try:
-				ki[key.strip()] = int(val.strip())
+				ki[key] = int(val)
 			except ValueError:
 				pass  # strings like 'name = Linux' are ignored
+	if empty:
+		print(f'[analysis1] kernelinfo: {len(empty)} key(s) have no value, i.e. '
+			  f'gdb found no such field in this kernel: {empty}')
 	return ki
 
 
@@ -935,16 +1105,28 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 	pm = ProcessMappings(panda, ki)
 
+	# The node-layout offsets only exist on the era that uses them, so print per
+	# era rather than unconditionally — ProcessMappings leaves the other era's
+	# attributes unset, and a debug print must not be what crashes the replay.
+	if pm.era == 'maple':
+		_vma_offsets = (
+			f'mm_mt={pm._MM_MT_OFFSET} ma_root={pm._MT_MA_ROOT_OFFSET} '
+			f'mn_slot0={pm._MN_SLOT0_OFFSET} mn_slots={pm._MN_NUM_SLOTS} '
+			f'mr64_pivot0={pm._MR64_PIVOT0_OFFSET} mr64_num_pivots={pm._MR64_NUM_PIVOTS} '
+			f'mr64_slot={pm._MR64_SLOT_OFFSET} mr64_meta={pm._MR64_META_OFFSET} mr64_slots={pm._MR64_NUM_SLOTS} '
+			f'ma64_pivot0={pm._MA64_PIVOT0_OFFSET} ma64_num_pivots={pm._MA64_NUM_PIVOTS} '
+			f'ma64_slot={pm._MA64_SLOT_OFFSET} ma64_meta={pm._MA64_META_OFFSET} ma64_slots={pm._MA64_NUM_SLOTS} '
+		)
+	else:
+		_vma_offsets = f'mmap={pm._MM_MMAP_OFFSET} vm_next={pm._VMA_VM_NEXT} '
 	print(
-		f'[analysis1] VMA walker offsets: '
-		f'mm_mt={pm._MM_MT_OFFSET} ma_root={pm._MT_MA_ROOT_OFFSET} '
-		f'mn_slot0={pm._MN_SLOT0_OFFSET} mn_slots={pm._MN_NUM_SLOTS} '
-		f'mr64_pivot0={pm._MR64_PIVOT0_OFFSET} mr64_num_pivots={pm._MR64_NUM_PIVOTS} '
-		f'mr64_slot={pm._MR64_SLOT_OFFSET} mr64_meta={pm._MR64_META_OFFSET} mr64_slots={pm._MR64_NUM_SLOTS} '
-		f'ma64_pivot0={pm._MA64_PIVOT0_OFFSET} ma64_num_pivots={pm._MA64_NUM_PIVOTS} '
-		f'ma64_slot={pm._MA64_SLOT_OFFSET} ma64_meta={pm._MA64_META_OFFSET} ma64_slots={pm._MA64_NUM_SLOTS} '
-		f'vma_start={pm._VMA_VM_START} vma_end={pm._VMA_VM_END} vma_flags={pm._VMA_VM_FLAGS} vma_file={pm._VMA_VM_FILE} '
-		f'task_mm={pm._TASK_MM} f_path_dentry={pm._F_PATH_DENTRY} d_iname={pm._D_INAME}'
+		f'[analysis1] VMA walker: era={pm.era} '
+		f'({"maple tree, 6.1+" if pm.era == "maple" else "mmap linked list, pre-6.1"}) '
+		+ _vma_offsets
+		+ f'vma_start={pm._VMA_VM_START} vma_end={pm._VMA_VM_END} '
+		  f'vma_flags={pm._VMA_VM_FLAGS} vma_file={pm._VMA_VM_FILE} '
+		  f'task_mm={pm._TASK_MM} f_path_dentry={pm._F_PATH_DENTRY} '
+		  f'd_iname={pm._D_INAME}'
 	)
 
 	# ------------------------------------------------------------------
@@ -2070,8 +2252,8 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 						  'is no store to observe.  Not a taint negative.  See '
 						  '"GETTING THE STORE TO EXECUTE" at the top of this file: '
 						  'either patch the wrappers and re-record, or rely on a '
-						  'source-reading target (here: p9_read_work_src) which '
-						  'needs no store at all.')
+						  'source-reading target (p9_read_work, '
+						  'ext4_write_inline_data) which needs no store at all.')
 			elif outcome == 'store_not_read':
 				print(f'[analysis1] *** INCONCLUSIVE ({tag}): a store landed at '
 					  f'pc={result["last_store_pc"]} but the probe never read the '

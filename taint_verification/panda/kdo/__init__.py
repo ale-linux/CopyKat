@@ -175,6 +175,13 @@ def update_config(share_path, kasan_multi_shot=False):
 			conf["extra_qemu_kernel_args"] = conf["extra_qemu_kernel_args"].replace(
 				"console=ttyS0", "kasan_multi_shot console=ttyS0"
 			)
+	# Explicitly disable panic_on_warn so a WARNING does not take the VM down
+	# mid-recording (syzkaller-derived kernel configs often set it by default).
+	# Same double-insertion guard as above.
+	if "panic_on_warn" not in conf["extra_qemu_kernel_args"]:
+		conf["extra_qemu_kernel_args"] = conf["extra_qemu_kernel_args"].replace(
+			"console=ttyS0", "panic_on_warn=0 console=ttyS0"
+		)
 	print(f"[kdo] config: share_path={share_path!r}")
 	print(f"[kdo] config: kasan_multi_shot={kasan_multi_shot!r}")
 	print(f"[kdo] config: extra_qemu_kernel_args={conf['extra_qemu_kernel_args']!r}")
