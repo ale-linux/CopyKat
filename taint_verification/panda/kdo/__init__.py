@@ -310,6 +310,20 @@ def __record(rootfs, output, timeout, repro_id, skip_rsync=False):
 		panda.run_monitor_cmd("end_record")
 		print("Finished record")
 		panda.end_analysis()
+		# end_analysis() only *queues* stop_run onto pypanda's internal async
+		# thread, which has to win the GIL against a vCPU thread emulating the
+		# post-panic mdelay() busy-loop at 100% CPU (panic_timeout=86400, see
+		# "Rebooting in 86400 seconds" in record.txt).  vl.c also calls
+		# vm_start() right after rr_do_end_record(), so the guest is *resumed*
+		# with a flushed TB cache once recording stops.  Waiting on the queued
+		# task took tens of minutes.  Set the break flag directly instead.
+		#
+		# Ordering matters: run_monitor_cmd("end_record") returns once the
+		# monitor has replied, so rr_control.next == RR_OFF is already set.
+		# The next vl.c iteration finalizes the recording and only *then*
+		# checks panda_break_vl_loop_req, so the recording is still written
+		# out in full.  Setting the flag any earlier would truncate it.
+		panda.stop_run()
 		print("drive returns")
 
 	panda.run()
