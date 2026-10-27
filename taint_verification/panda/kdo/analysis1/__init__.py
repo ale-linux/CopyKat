@@ -683,6 +683,184 @@ BUG_CATALOGUE = (
 		'confirm':  'kasan_report',
 	},
 	{
+		# The THIRD instance of the source-read shape, and the closest thing in the
+		# catalogue to a textbook one: an OOB memcpy whose source is in registers at
+		# hook entry, confirmed by a real kasan_report call.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in udf_find_entry+0x9fb/0x1230
+		#     Write of size 105 at addr ffff8880242b0296 by task repro/2898
+		#     kasan_report+0xbb/0x1f0
+		#     kasan_check_range+0x14c/0x1a0
+		#     memcpy+0x39/0x60
+		#     udf_find_entry+0x9fb/0x1230
+		#     udf_lookup+0x162/0x280
+		#
+		# The faulting frame is a `call memcpy`, so memcpy itself is the hook and
+		# rdi/rsi/rdx hold (dest, src, len) — exactly the p9_read_work and
+		# ext4_write_inline_data shape.  The disassembly (gdb prints its <sym+N>
+		# labels in DECIMAL; the offsets below are the hex ones the report uses):
+		#
+		#   udf_find_entry+0x9ef: mov    0x28(%rbp),%rsi   ; src, off a struct field
+		#   udf_find_entry+0x9f3: mov    %r13,%rdi         ; dest
+		#   udf_find_entry+0x9f6: call   memcpy
+		#   udf_find_entry+0x9fb: mov    0x38(%rsp),%rax   <- +0x9fb (ret addr)
+		#
+		# 0x9f6 + 5 (call rel32) = 0x9fb, so the offset the report prints is the
+		# RETURN ADDRESS of that call — what callstack_instr gives as callers[0] at
+		# memcpy entry, hence ('frame', 0, ..., 0x9fb).
+		#
+		# confirm='kasan_report' fires here, and the report says so twice over:
+		# kasan_check_range+0x14c IS a frame, which it can only be if kasan_report was
+		# reached by a real CALL rather than the tail jump of "THE FOURTH SHAPE" —
+		# kasan_check_range returns `!kasan_report(...)` and the negation forces a
+		# non-sibling call.  memcpy+0x39 is the return address of the SECOND
+		# kasan_check_range, i.e. the DESTINATION check; the first (src, with %edx
+		# zeroed) passed, and reaching the second is the proof of that.  So the
+		# confirming report is about dest and report_matches' range test would reject a
+		# src-range report anyway.
+		#
+		# source-only, for the same disassembly-level reason as ext4_write_inline_data:
+		# memcpy ACTS on the dest check's result (`test %al,%al; je` -> return NULL),
+		# so the occurrence whose report is PRINTED never reaches __memcpy and there is
+		# no store to watch.  Reading src is not a workaround for that but the same
+		# answer — the copy is verbatim, so taint2 propagates labels byte-for-byte and
+		# src[0..105) carries exactly the labels post-store dest[0..105) would.  See
+		# "GETTING THE STORE TO EXECUTE".
+		#
+		# Where the taint comes from differs from the two entries above and is worth
+		# recording, because it is what the verdict depends on.  src is loaded from a
+		# struct field (0x28(%rbp)), not from a user pointer: udf_find_entry walks
+		# directory entries out of buffer_heads, so these bytes are filesystem METADATA
+		# read back from the UDF image the reproducer supplied.  Labels therefore have
+		# to reach it as repro heap -> write(2) into the image/loop device -> page cache
+		# -> buffer_head -> this memcpy, which is the same multi-hop route
+		# ext4_write_inline_data relies on; if this entry hits but reads untainted, that
+		# propagation chain is the first thing to check, not the pedigree.
+		'id':       'udf_find_entry',
+		'hook':     'memcpy',
+		'args':     'memcpy',
+		# Frame 0 alone, like ext4_write_inline_data and unlike p9_read_work: that one
+		# needed an 'anywhere' because _copy_to_iter+0x997 matches every pipe/socket
+		# read through that call site, whereas udf_find_entry+0x9fb is one call site on
+		# the UDF lookup path and is already specific.  udf_lookup+0x162 is on the stack
+		# (the report prints it without a '?', so ORC resolved it from a real frame) and
+		# can be added as an 'anywhere' if this ever needs more pruning.
+		#
+		# This makes three targets on the `memcpy` hook; that widens hook_prefilter
+		# rather than breaking it, since all three constrain frame 0, so the prefilter
+		# stays a depth-1 query whose test is an OR over targets.
+		'pedigree': (('frame', 0, ('udf_find_entry',), 0x9fb),),
+		# hook == store_fn == memcpy, so the window spans exactly one call and the
+		# confirming report can only be the one that call raised — same reasoning as
+		# p9_read_work and ext4_write_inline_data.  The ordering falls out too:
+		# kasan_report runs INSIDE memcpy, so the window is confirmed, the source read
+		# taken and the observation finalised before on_ret(memcpy) arrives to close it.
+		'store_fn': 'memcpy',
+		# "by task repro/2898" — the process scope, not a kworker.
+		'ctx':      'repro',
+		'source':   True,
+		'dest':     False,
+		'confirm':  'kasan_report',
+	},
+	{
+		# The FOURTH instance of the source-read shape, and the second UDF one: an OOB
+		# memcpy whose source is in registers at hook entry, confirmed by a real
+		# kasan_report call.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in udf_readdir+0xf8e/0x1ae0
+		#     Write of size 201 at addr ffff88802cb8da36 by task repro/2905
+		#     kasan_report+0xbb/0x190
+		#     kasan_check_range+0x14c/0x1a0
+		#     memcpy+0x39/0x60
+		#     udf_readdir+0xf8e/0x1ae0
+		#     iterate_dir+0x575/0x700
+		#     __x64_sys_getdents64+0x14a/0x2e0
+		#
+		# The faulting frame is a `call memcpy`, so memcpy itself is the hook and
+		# rdi/rsi/rdx hold (dest, src, len) — the same shape as udf_find_entry,
+		# p9_read_work and ext4_write_inline_data.  The disassembly (gdb prints its
+		# <sym+N> labels in DECIMAL; the offsets below are the hex ones the report
+		# uses):
+		#
+		#   udf_readdir+0xf7f: mov    0x28(%r15),%rsi   ; src, off a struct field
+		#   udf_readdir+0xf83: sub    %rdx,%rdi         ; dest, computed
+		#   udf_readdir+0xf86: add    %r13,%rdi
+		#   udf_readdir+0xf89: call   memcpy
+		#   udf_readdir+0xf8e: jmp    udf_readdir+0xa23  <- +0xf8e (ret addr)
+		#
+		# 0xf89 + 5 (call rel32) = 0xf8e, so the offset the report prints is the RETURN
+		# ADDRESS of that call — what callstack_instr gives as callers[0] at memcpy
+		# entry, hence ('frame', 0, ..., 0xf8e).
+		#
+		# NB the return address holds a `jmp`, not a fall-through instruction: this
+		# memcpy sits in an out-of-line block that jumps back to +0xa23 (2595 decimal,
+		# which is the jump TARGET and not an address any pedigree wants).  That is
+		# cosmetic for a SOURCE target and is called out only because it is exactly the
+		# layout that matters for a destination one: nothing here decodes the
+		# instruction at frame 0, the taint is read before the copy, and there is no
+		# store watcher whose arming could care where control goes next.  Compare the
+		# warning under 'hook_backtrace' in finalise(), which is about dest readings.
+		#
+		# confirm='kasan_report' fires here, and the report evidences it twice over:
+		# kasan_check_range+0x14c IS a frame, which it can only be if kasan_report was
+		# reached by a real CALL rather than the tail jump of "THE FOURTH SHAPE" —
+		# kasan_check_range returns `!kasan_report(...)` and the negation forces a
+		# non-sibling call.  memcpy+0x39 is the return address of the SECOND
+		# kasan_check_range, i.e. the DESTINATION check; the first (src, with %edx
+		# zeroed) passed, and reaching the second is the proof of that.  So the
+		# confirming report is about dest, and report_matches' range test would reject
+		# a src-range report anyway.
+		#
+		# source-only, for the same disassembly-level reason as the other memcpy
+		# entries: memcpy ACTS on the dest check's result (`test %al,%al; je` ->
+		# return NULL), so the occurrence whose report is PRINTED never reaches
+		# __memcpy and there is no store to watch.  Reading src is not a workaround for
+		# that but the same answer — the copy is verbatim, so taint2 propagates labels
+		# byte-for-byte and src[0..201) carries exactly the labels post-store
+		# dest[0..201) would.  See "GETTING THE STORE TO EXECUTE".
+		#
+		# Taint reaches src the same multi-hop way as udf_find_entry, and for the same
+		# reason: src is loaded from a struct field (0x28(%r15)), not from a user
+		# pointer, because udf_readdir copies directory-entry bytes out of a
+		# buffer_head.  So these are filesystem METADATA bytes read back from the UDF
+		# image the reproducer supplied, and labels have to arrive as repro heap ->
+		# write(2) into the image/loop device -> page cache -> buffer_head -> this
+		# memcpy.  If this entry hits but reads untainted, that propagation chain is the
+		# first thing to check, not the pedigree.
+		#
+		# The DESTINATION is the other half of why this is source-only, and it differs
+		# from udf_find_entry: rdi is computed (`sub %rdx,%rdi; add %r13,%rdi`) into a
+		# caller-supplied getdents64 buffer rather than taken from a field, so there is
+		# no second register that names the object a dest probe would watch.
+		'id':       'udf_readdir',
+		'hook':     'memcpy',
+		'args':     'memcpy',
+		# Frame 0 alone, like udf_find_entry and ext4_write_inline_data: udf_readdir
+		# +0xf8e is one call site on the getdents path and is already specific, unlike
+		# p9_read_work's _copy_to_iter+0x997, which matches every pipe/socket read
+		# through that call site and needed an 'anywhere' to prune.  iterate_dir+0x575
+		# and __x64_sys_getdents64+0x14a are on the stack (the report prints both
+		# without a '?', so ORC resolved them from real frames) and either can be added
+		# as an 'anywhere' if this ever needs more pruning.
+		#
+		# This makes FOUR targets on the `memcpy` hook.  That widens hook_prefilter
+		# rather than breaking it: all four constrain frame 0, so the prefilter stays a
+		# depth-1 query whose test is an OR over targets.
+		'pedigree': (('frame', 0, ('udf_readdir',), 0xf8e),),
+		# hook == store_fn == memcpy, so the window spans exactly one call and the
+		# confirming report can only be the one that call raised — same reasoning as
+		# the other memcpy entries.  The ordering falls out too: kasan_report runs
+		# INSIDE memcpy, so the window is confirmed, the source read taken and the
+		# observation finalised before on_ret(memcpy) arrives to close it.
+		'store_fn': 'memcpy',
+		# "by task repro/2905" — the process scope, not a kworker.  Consistent with
+		# the stack: this is a getdents64 syscall made by the reproducer itself.
+		'ctx':      'repro',
+		'source':   True,
+		'dest':     False,
+		'confirm':  'kasan_report',
+	},
+	{
 		# CONFIG_KASAN_INLINE: the shadow check is open-coded into
 		# fuse_dev_do_write and the only call left on the failure path is the
 		# report thunk, so the report has no KASAN-helper frame to hook —
