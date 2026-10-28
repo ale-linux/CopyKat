@@ -1009,6 +1009,122 @@ BUG_CATALOGUE = (
 		'confirm':     'hook',
 	},
 	{
+		# CONFIG_KASAN_INLINE, the FOURTH instance of "THE THIRD SHAPE" and the first
+		# time two targets share a report thunk.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in ntfs_set_ea+0x126d/0x1360
+		#     Write of size 4 at addr ffff888033a3fd90 by task repro/3539
+		#     kasan_report+0xbb/0x180
+		#     ntfs_set_ea+0x126d/0x1360
+		#     ntfs_setxattr+0x403/0x880
+		#     __vfs_setxattr+0x115/0x180
+		#     setxattr+0x146/0x160
+		#
+		# The disassembly around the thunk call (gdb prints its <sym+N> labels in
+		# DECIMAL; the offsets below are the hex ones the report uses):
+		#
+		#   ntfs_set_ea+0x125b: call   __asan_report_load4_noabort   ; a READ, not ours
+		#   ntfs_set_ea+0x1260: jmp    ntfs_set_ea+0x970
+		#   ntfs_set_ea+0x1265: mov    %r14,%rdi                     ; the OOB address
+		#   ntfs_set_ea+0x1268: call   __asan_report_store4_noabort
+		#   ntfs_set_ea+0x126d: jmp    ntfs_set_ea+0x79c    <- +0x126d (ret addr)
+		#
+		# 0x1268 + 5 (call rel32) = 0x126d, so the offset the report prints is the
+		# RETURN ADDRESS of that call — callers[0] at thunk entry, hence
+		# ('frame', 0, ..., 0x126d).  Note the LOAD thunk five bytes earlier, whose
+		# return address is +0x1260: that is an out-of-bounds READ and not what this
+		# module is for.  It cannot be confused with this entry, because it is a
+		# different hook SYMBOL rather than a different offset on the same one — but it
+		# is why the pedigree offset has to be read off the right `call`.
+		#
+		# confirm='hook', and the thunk's own disassembly is the proof that no other
+		# mode is needed here:
+		#
+		#   __asan_report_store4_noabort+0:  mov    (%rsp),%rcx   ; _RET_IP_
+		#   __asan_report_store4_noabort+4:  mov    $0x1,%edx     ; is_write = true
+		#   __asan_report_store4_noabort+9:  mov    $0x4,%esi     ; size = 4
+		#   __asan_report_store4_noabort+14: jmp    kasan_report
+		#
+		# Four instructions, no shadow test, no conditional: the function does nothing
+		# but marshal arguments and jump.  So it is reachable ONLY from a failure path
+		# the inlined check already decided, which is precisely what makes the pedigree
+		# match the confirmation.  The two things that could otherwise be in tension
+		# both resolve in favour of 'hook':
+		#
+		#   * on_call(kasan_report) will NEVER fire, exactly as the dump shows (`jmp`,
+		#     not `call`, because the void thunk discards the result), so
+		#     confirm='kasan_report' would resolve, look available, and silently never
+		#     confirm.
+		#   * confirm='print_report' is not needed and would be strictly worse.  That
+		#     mode exists for a hook that is ALSO on the success path — __asan_store8
+		#     is called for every 8-byte store at its site, so reaching it says nothing
+		#     and only a printed report can discriminate.  A report THUNK has no
+		#     success path at all, so there is nothing left to discriminate.  Using it
+		#     anyway would add a dependency on kasan_multi_shot (print_report sits
+		#     behind kasan_report's report_suppressed()/report_enabled() gate) and
+		#     would therefore make a SUPPRESSED occurrence unconfirmable — trading a
+		#     free, exact confirmation for a conditional one.  See "THE THIRD SHAPE"
+		#     and "THE FOURTH SHAPE" in the module docstring.
+		#
+		# THE STORE EXECUTES on a stock kernel, and here the disassembly says so
+		# directly rather than by appeal to the C: the instruction at the return
+		# address is an unconditional `jmp` back to +0x79c, with no test of any return
+		# value, so the instrumented code has nothing to veto on.  No kernel patch and
+		# no boot parameter — see "GETTING THE STORE TO EXECUTE".
+		#
+		# THE STORE IS NOT AT THE RETURN ADDRESS, for the same reason as every inline
+		# entry: the report call sits in a cold out-of-line block (+0x1268 of a 0x1360
+		# function) that jumps back to the hot path at +0x79c, so the store executes
+		# some distance away.  The watcher is dst-keyed and the after_insn gate is
+		# unconditional, which is what makes that a non-issue — see "COST".
+		#
+		# dest-only: rdi is the only thing the thunk is handed, and the stored value is
+		# a computed 4-byte quantity rather than a copy out of some buffer, so there is
+		# no source to read even in principle.  Same reasoning as fuse_dev_do_write and
+		# bpf_get_stackid.
+		'id':          'ntfs_set_ea',
+		'hook':        '__asan_report_store4_noabort',
+		'args':        'ptr',
+		'access_size': 4,          # the '4' in the hook's name; "Write of size 4"
+		# Frame 0 alone.  One instruction in a cold report block is already unique and
+		# the thunk is ice cold — only ever reached on a failed check — so there is no
+		# hot path to prune.  ntfs_setxattr+0x403 and setxattr+0x146 are on the stack
+		# (the report prints both without a '?', so ORC resolved them from real frames)
+		# and either can be added as an 'anywhere' if this ever needs more.
+		#
+		# This is the SECOND target on __asan_report_store4_noabort, which widens
+		# hook_prefilter rather than breaking it: both constrain frame 0, so the
+		# prefilter stays a depth-1 query whose test is an OR over targets, and the two
+		# pedigrees are disjoint addresses so at most one can match a given call.
+		# Both are also destination targets; there is a single watcher/probe pair, and
+		# _on_hook_call's supersede rule already closes an older destination window
+		# when a new one opens.  They cannot collide in practice anyway — one kernel
+		# has one of these two bugs, not both.
+		#
+		# One spelling only, deliberately.  The report prints 'ntfs_set_ea' bare, and
+		# that is direct evidence about THIS vmlinux — the same trace also prints
+		# 'ntfs_read_ea.constprop.0', so the compiler did suffix a sibling in this
+		# file and still left ntfs_set_ea alone.  Adding the suffixed spellings would
+		# not buy a fallback either: 0x126d was read off this build's disassembly,
+		# and a build that cloned the function into ntfs_set_ea.constprop.0 is one
+		# whose code layout changed, so the offset would no longer name the `call`.
+		# _first_ksym would resolve the clone and the pedigree would then point at
+		# whatever happens to live at +0x126d there — a silent no-hit, or worse a
+		# wrong one.  A missing symbol instead fails loudly ('pedigree symbol
+		# ntfs_set_ea not found', target disabled with a reason in analysis1.json),
+		# which is the better failure for an offset that is only valid for one build.
+		'pedigree':    (('frame', 0, ('ntfs_set_ea',), 0x126d),),
+		# The store lands back on the hot path inside ntfs_set_ea itself (the cold
+		# block jumps to +0x79c), well before it returns to ntfs_setxattr.
+		'store_fn':    'ntfs_set_ea',
+		# "by task repro/3539" — the process scope, not a kworker.  Consistent with
+		# the stack: this is a setxattr(2) made by the reproducer itself.
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	{
 		# CONFIG_KASAN_OUTLINE: the shadow check is NOT open-coded, so the
 		# compiler emits a plain `call __asan_store8` for the access and that
 		# helper does the check itself.  The report is:
