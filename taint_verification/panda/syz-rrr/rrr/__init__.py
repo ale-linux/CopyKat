@@ -756,10 +756,22 @@ def replay(rootfs, kernel, record, replay_func=__replay, additional_args=None):
             continue
         # Never cache the stimulus/repro binary — it changes on every run.
         cache_path = elf_file + '.nm.pickle' if elf_file != rootfs.stimulus_debug_path else None
+        cache_data = None
         if cache_path and os.path.exists(cache_path):
             log("Loading cached symbol table for " + elf_file + " ...")
-            with open(cache_path, 'rb') as cf:
-                cache_data = pickle.load(cf)
+            # A concurrent writer may have the cache open and partially
+            # written (see the atomic-rename note below for why that should no
+            # longer happen).  Treat any unreadable cache as a miss and fall
+            # through to parsing nm rather than killing the worker — with
+            # --npar 50 one bad read used to abort the whole pool.
+            try:
+                with open(cache_path, 'rb') as cf:
+                    cache_data = pickle.load(cf)
+            except (EOFError, pickle.UnpicklingError, OSError) as e:
+                log(f"Ignoring unreadable symbol cache {cache_path}: {e!r}")
+                cache_data = None
+
+        if cache_data is not None:
             for name, address in cache_data.items():
                 if re.match(ignored_symbols_re, name):
                     ignored_addresses.add(address)
@@ -788,8 +800,29 @@ def replay(rootfs, kernel, record, replay_func=__replay, additional_args=None):
                 cache_data[name] = address
 
         if cache_path:
-            with open(cache_path, 'wb') as cf:
-                pickle.dump(cache_data, cf)
+            # Write to a private temp file and rename into place.  open(...,'wb')
+            # truncates immediately, so with several workers racing on the same
+            # vmlinux cache a reader could see a 0-byte file and get
+            # "EOFError: Ran out of input" from pickle.load.  rename(2) is
+            # atomic within a filesystem, so a reader sees either the old cache
+            # or the complete new one, never a half-written one.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=os.path.dirname(cache_path) or '.',
+                prefix=os.path.basename(cache_path) + '.tmp')
+            try:
+                with os.fdopen(tmp_fd, 'wb') as cf:
+                    pickle.dump(cache_data, cf)
+                    cf.flush()
+                    os.fsync(cf.fileno())
+                os.rename(tmp_path, cache_path)
+            except BaseException:
+                # Never leave the temp file behind, and never let a cache-write
+                # failure abort an otherwise-successful analysis.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
             log("Saved symbol cache to " + cache_path)
 
     args = [rootfs, kernel, record, ignored_addresses, func_map, symbol_map]
