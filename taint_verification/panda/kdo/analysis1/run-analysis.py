@@ -54,6 +54,7 @@ class NestablePool(multiprocessing.pool.Pool):
 
 share_path = None
 multi_shot = False
+taint_pointers = False
 
 
 def doit(repro):
@@ -100,13 +101,14 @@ def doit(repro):
         # report it and carry on rather than letting one expected abort take
         # down the whole pool.map batch.
         try:
-            analysis1.replay(rootfs, kernel, stop_on_first_violation=False)
+            analysis1.replay(rootfs, kernel, stop_on_first_violation=False,
+                             taint_pointers=taint_pointers)
         except Exception as e:
             print(f"[run-analysis] {repro_id}: replay ended with {e!r} — expected "
                   f"in --multi-shot; results already written to analysis1.json")
             return 'aborted-after-collection'
     else:
-        analysis1.replay(rootfs, kernel)
+        analysis1.replay(rootfs, kernel, taint_pointers=taint_pointers)
 
     return True
 
@@ -150,13 +152,19 @@ def main() -> None:
     opts.add_argument('--multi-shot', action='store_true',
             help='collect every OOB violation instead of stopping at the first '
                  'confirmed one; analysis1.json is rewritten after each hit')
+    opts.add_argument('--enable-tp', action='store_true',
+            help='let taint2 propagate labels through tainted pointers '
+                 '(drops its no_tp flag).  Disabled by default')
     args = opts.parse_args()
 
-    global share_path, multi_shot
+    global share_path, multi_shot, taint_pointers
     share_path = args.share_path
     multi_shot = args.multi_shot
+    taint_pointers = args.enable_tp
     if multi_shot:
         print('[run-analysis] --multi-shot: collecting all violations')
+    if taint_pointers:
+        print('[run-analysis] --enable-tp: taint2 tainted-pointer propagation on')
 
     # Recording ran with kdo.update_config(share_path), which appends
     # `-fsdev local,... -device virtio-9p-pci,...` to the QEMU machine args.

@@ -1210,6 +1210,113 @@ BUG_CATALOGUE = (
 		'confirm':     'hook',
 	},
 	{
+		# CONFIG_KASAN_INLINE, and the SECOND target on
+		# __asan_report_store8_noabort — the same shape as bpf_get_stackid, reached
+		# through bcachefs's journal setup.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in bch2_dev_journal_init+0x677/0x7e0
+		#     Write of size 8 at addr ffff888029d994b0 by task repro/4696
+		#     kasan_report+0xbd/0xf0
+		#     bch2_dev_journal_init+0x677/0x7e0
+		#     __bch2_dev_attach_bdev+0x19d/0x540
+		#     bch2_dev_attach_bdev+0x28f/0x880
+		#     bch2_fs_open+0x8e9/0x1120
+		#
+		# The disassembly around the report call (gdb prints its <sym+N> labels in
+		# DECIMAL; the offsets below are the hex ones the report uses):
+		#
+		#   bch2_dev_journal_init+0x665: call   __asan_report_load8_noabort  ; a READ
+		#   bch2_dev_journal_init+0x66a: jmp    bch2_dev_journal_init+0x3d3
+		#   bch2_dev_journal_init+0x66f: mov    %rbp,%rdi                   ; the OOB addr
+		#   bch2_dev_journal_init+0x672: call   __asan_report_store8_noabort
+		#   bch2_dev_journal_init+0x677: jmp    bch2_dev_journal_init+0x404  <- +0x677
+		#
+		# 0x672 + 5 (call rel32) = 0x677, so the offset the report prints is the RETURN
+		# ADDRESS of that call — what callstack_instr gives as callers[0] at thunk
+		# entry, hence ('frame', 0, ..., 0x677).
+		#
+		# The load8 thunk two call sites earlier is a convenient reminder that the
+		# report-thunk family splits read from write by SYMBOL, not by argument: it is a
+		# different function, so it can never reach this hook and needs no exclusion in
+		# the pedigree.  Only the store thunks are out-of-bounds WRITES, which is what
+		# this module is for.
+		#
+		# confirm='hook', and this kernel's own thunk disassembly is the proof:
+		#
+		#   __asan_report_store8_noabort+0:  endbr64
+		#   __asan_report_store8_noabort+4:  mov    (%rsp),%rcx   ; _RET_IP_
+		#   __asan_report_store8_noabort+8:  mov    $0x1,%edx     ; is_write = true
+		#   __asan_report_store8_noabort+13: mov    $0x8,%esi     ; size = 8
+		#   __asan_report_store8_noabort+18: jmp    kasan_report
+		#
+		# Five instructions, no shadow test, no conditional: the thunk only marshals
+		# arguments and jumps, so it is reachable ONLY from a failure path the inlined
+		# check already decided.  That is what makes the pedigree match the
+		# confirmation.  It also rules out the other two modes for this entry the same
+		# way it does for ntfs_set_ea: the final `jmp` (not `call`) means
+		# on_call(kasan_report) never fires, so confirm='kasan_report' would resolve,
+		# look available and silently never confirm; and confirm='print_report' would
+		# add a kasan_multi_shot dependency to discriminate a success path that a report
+		# thunk does not have, making a SUPPRESSED occurrence unconfirmable for nothing.
+		# The report's own backtrace agrees — kasan_report+0xbd sits directly above
+		# bch2_dev_journal_init+0x677 with no thunk frame between them.
+		#
+		# THE STORE EXECUTES on a stock kernel, and the disassembly says so directly:
+		# the instruction at the return address is an unconditional `jmp` back to
+		# +0x404, with no test of any return value, so the instrumented code has nothing
+		# to veto on.  No kernel patch and no boot parameter — see "GETTING THE STORE TO
+		# EXECUTE".
+		#
+		# THE STORE IS NOT AT THE RETURN ADDRESS, as for every inline entry: the report
+		# call sits in a cold out-of-line block (+0x672 of a 0x7e0 function) that jumps
+		# back to the hot path at +0x404, so the store executes some distance away.  The
+		# watcher is dst-keyed and the after_insn gate is unconditional, which is what
+		# makes that a non-issue — see "COST".
+		#
+		# dest-only, and not merely because a source would be inconvenient: rdi is the
+		# only thing the thunk is handed, so there is no source register to read even in
+		# principle.  This is the case the note under "Two shapes" reserves for the
+		# destination probe — same as fuse_dev_do_write, bpf_get_stackid and ntfs_set_ea.
+		'id':          'bch2_dev_journal_init',
+		'hook':        '__asan_report_store8_noabort',
+		'args':        'ptr',
+		'access_size': 8,          # the '8' in the hook's name; "Write of size 8"
+		# Frame 0 alone.  One instruction in a cold report block is already unique and
+		# the thunk is ice cold — only ever reached on a failed check — so there is no
+		# hot path to prune.  __bch2_dev_attach_bdev+0x19d and bch2_dev_attach_bdev
+		# +0x28f are on the stack (the report prints both without a '?', so ORC resolved
+		# them from real frames) and either can be added as an 'anywhere' if this ever
+		# needs more.
+		#
+		# This is the SECOND target on __asan_report_store8_noabort, which widens
+		# hook_prefilter rather than breaking it, exactly as the two
+		# __asan_report_store4_noabort targets do: both constrain frame 0, so the
+		# prefilter stays a depth-1 query whose test is an OR over targets, and the two
+		# pedigrees are disjoint addresses so at most one can match a given call.  Both
+		# are destination targets sharing the single watcher/probe pair, and
+		# _on_hook_call's supersede rule already closes an older destination window when
+		# a new one opens; they cannot collide in practice anyway, since one kernel has
+		# one of these bugs and not both.
+		#
+		# One spelling only, for the reason spelled out on ntfs_set_ea: 0x677 was read
+		# off this build's disassembly, so a build that cloned the function into a
+		# .constprop/.isra sibling is one whose layout changed and whose +0x677 no
+		# longer names the `call`.  A missing symbol fails loudly (target disabled with
+		# a reason in analysis1.json), which beats resolving a clone and pointing the
+		# pedigree at whatever happens to live there.
+		'pedigree':    (('frame', 0, ('bch2_dev_journal_init',), 0x677),),
+		# The store lands back on the hot path inside bch2_dev_journal_init itself (the
+		# cold block jumps back to +0x404), well before it returns to
+		# __bch2_dev_attach_bdev.
+		'store_fn':    'bch2_dev_journal_init',
+		# "by task repro/4696" — the process scope, not a kworker.  Consistent with the
+		# stack: this is a mount(2) syscall made by the reproducer itself.
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	{
 		# CONFIG_KASAN_OUTLINE: the shadow check is NOT open-coded, so the
 		# compiler emits a plain `call __asan_store8` for the access and that
 		# helper does the check itself.  The report is:
@@ -1449,8 +1556,14 @@ def _load_kernelinfo(path):
 
 
 def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
-			 enable_logging, stop_on_first_violation=True):
-	"""stop_on_first_violation:
+			 enable_logging, stop_on_first_violation=True, taint_pointers=False):
+	"""taint_pointers:
+	  False (default) — load taint2 with no_tp, so a load through a tainted
+	          pointer does not propagate the pointer's labels to the loaded
+	          value.
+	  True  — let taint2 propagate labels through pointers as well.
+
+	stop_on_first_violation:
 	  True  — end the replay as soon as one OOB write is confirmed tainted.  The
 	          run exits cleanly, because it stops before this recording's desync
 	          point (see the module docstring).
@@ -1473,7 +1586,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				  extra_args=conf["extra_qemu_machine_args"],
 				  os_version="linux-64-linux:1.0")
 
-	panda.load_plugin("taint2", args={"opt": True, "no_tp": True})
+	print(f'[analysis1] taint2: tainted-pointer propagation '
+		  f'{"ENABLED" if taint_pointers else "disabled"}')
+	panda.load_plugin("taint2", args={"opt": True, "no_tp": not taint_pointers})
 	panda.load_plugin("osi", args={"disable-autoload": True})
 	panda.load_plugin("osi_linux", args={
 		"kconf_file": kernel.info_path, "kconf_group": "linux:1.0:64"
@@ -3442,8 +3557,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 
 def replay(rootfs, kernel, enable_logging=True, record='record',
-		   stop_on_first_violation=True):
-	"""stop_on_first_violation:
+		   stop_on_first_violation=True, taint_pointers=False):
+	"""taint_pointers:
+	  False (default) — taint2 is loaded with no_tp: labels are not propagated
+	                    through tainted pointers.
+	  True            — taint2 propagates labels through tainted pointers too.
+
+	stop_on_first_violation:
 	  True  (default) — return as soon as one OOB write is confirmed tainted.
 	                    Exits cleanly.
 	  False           — run to the end of the analysis, collecting every
@@ -3453,4 +3573,5 @@ def replay(rootfs, kernel, enable_logging=True, record='record',
 	                    to that point (it is rewritten after each one)."""
 	print("starting")
 	rrr.replay(rootfs, kernel, record, __replay,
-			   additional_args=[enable_logging, stop_on_first_violation])
+			   additional_args=[enable_logging, stop_on_first_violation,
+								taint_pointers])
