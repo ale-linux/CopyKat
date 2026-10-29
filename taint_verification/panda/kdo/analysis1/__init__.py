@@ -1125,6 +1125,91 @@ BUG_CATALOGUE = (
 		'confirm':     'hook',
 	},
 	{
+		# CONFIG_KASAN_INLINE, and the first catalogue entry to hook the
+		# VARIABLE-WIDTH report thunk.  Otherwise the same third shape as
+		# fuse_dev_do_write, bpf_get_stackid and hfs_asc2mac.  The report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in udf_write_aext+0x86e/0x8d0
+		#     Write of size 4 at addr ffff88802c3713f8 by task repro/2903
+		#     kasan_report+0xbb/0x200
+		#     udf_write_aext+0x86e/0x8d0
+		#     udf_add_entry+0xd10/0x2ab0
+		#     udf_mkdir+0x149/0x650
+		#
+		# The disassembly around the report call (gdb prints its <sym+N> labels in
+		# DECIMAL, so the offsets below are the hex ones the report uses):
+		#
+		#   udf_write_aext+0x85c: jmp    udf_write_aext+0x4cd  ; in-bounds path
+		#   udf_write_aext+0x861: mov    $0x4,%esi             ; the SIZE argument
+		#   udf_write_aext+0x866: mov    %r14,%rdi             ; the OOB address
+		#   udf_write_aext+0x869: call   __asan_report_store_n_noabort
+		#   udf_write_aext+0x86e: jmp    udf_write_aext+0x588  <- +0x86e (ret addr)
+		#
+		# 0x869 + 5 (call rel32) = 0x86e, so the offset the report prints is the RETURN
+		# ADDRESS of that call — what callstack_instr gives as callers[0] at thunk
+		# entry, hence ('frame', 0, ..., 0x86e).  Neither jmp target (+0x588 = 1416
+		# decimal, +0x4cd = 1229) is an address any pedigree wants; they are where
+		# control goes, not where it came from.
+		#
+		# args='ptr_size', NOT 'ptr'.  This is the _n_ sibling of the fixed-width
+		# thunks, i.e. void __asan_report_store_n_noabort(void *addr, size_t size), so
+		# the width is a real argument in rsi (`mov $0x4,%esi` above) rather than a
+		# number baked into the symbol name.  So no access_size field: supplying one
+		# would be ignored, and the 4 in "Write of size 4" is read out of the register
+		# at hook entry instead.  The args-field docs above already named this case;
+		# this is the first entry to use it.
+		#
+		# That makes args='ptr_size' + confirm='hook' a combination no previous entry
+		# had — the other 'ptr_size' entry (bitmap_ip_add) confirms via kasan_report,
+		# and the other confirm='hook' entries are all 'ptr'.  The two are independent
+		# by construction: _hook_args only decides which registers dst/size come from,
+		# and the confirm='hook' path then uses whatever it returned.  _hook_report_ip
+		# needs no change either — it special-cases only 'ptr_size_write' (where
+		# kasan_report is itself the hook and takes ret_ip in rcx) and otherwise falls
+		# back to callers[0], which is right here: the thunk does not take ret_ip, it
+		# computes _RET_IP_, which IS its own return address.  Confirmed by the
+		# thunk's own disassembly, which loads rcx from the stack and sets edx before
+		# tail-jumping:
+		#
+		#   __asan_report_store_n_noabort+0: mov    (%rsp),%rcx   ; _RET_IP_ -> ret_ip
+		#   __asan_report_store_n_noabort+4: mov    $0x1,%edx     ; is_write = true
+		#   __asan_report_store_n_noabort+9: jmp    kasan_report
+		#
+		# Those three instructions also settle the confirm mode. The `jmp` means
+		# on_call(kasan_report) never fires, so confirm='kasan_report' could not work
+		# and kasan_report must not be the hook; the report's own backtrace shows the
+		# same thing from the other side, with kasan_report+0xbb sitting directly above
+		# udf_write_aext+0x86e and no thunk frame between them. confirm='hook' is
+		# right because the thunk exists only on the failure path, so reaching it is
+		# itself the report, and `mov $0x1,%edx` confirms the is_write=True the
+		# synthesised record asserts. No kasan_multi_shot needed.
+		#
+		# dest-only: the thunk is handed an address and a width, never a source buffer,
+		# and the stored value is a computed 4-byte field (udf_write_aext packs an
+		# allocation descriptor), not a copy. The store executes on a stock kernel
+		# because the thunk returns void and the instrumented code acts on nothing it
+		# returns — see "GETTING THE STORE TO EXECUTE".
+		'id':          'udf_write_aext',
+		'hook':        '__asan_report_store_n_noabort',
+		'args':        'ptr_size',   # (addr, size) in rdi/rsi — see the note above
+		# One instruction in a cold report block is already unique, and the thunk is
+		# ice cold — only ever reached on a failed check — so frame 0 alone is enough.
+		# udf_add_entry+0xd10 and udf_mkdir+0x149 are on the stack (the report prints
+		# both without a '?', so ORC resolved them from real frames) and either can be
+		# added as an 'anywhere' if this ever needs more pruning.
+		'pedigree':    (('frame', 0, ('udf_write_aext',), 0x86e),),
+		# The store lands back on the hot path inside udf_write_aext itself: the cold
+		# report block jumps back to +0x588, well before the function returns to
+		# udf_add_entry.
+		'store_fn':    'udf_write_aext',
+		# "by task repro/2903" — the process scope, not a kworker.  Consistent with
+		# the stack: this is an mkdir(2) syscall made by the reproducer itself.
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	{
 		# CONFIG_KASAN_OUTLINE: the shadow check is NOT open-coded, so the
 		# compiler emits a plain `call __asan_store8` for the access and that
 		# helper does the check itself.  The report is:
