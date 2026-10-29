@@ -1556,8 +1556,14 @@ def _load_kernelinfo(path):
 
 
 def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
-			 enable_logging, stop_on_first_violation=True):
-	"""stop_on_first_violation:
+			 enable_logging, stop_on_first_violation=True, taint_pointers=False):
+	"""taint_pointers:
+	  False (default) — load taint2 with no_tp, so a load through a tainted
+	          pointer does not propagate the pointer's labels to the loaded
+	          value.
+	  True  — let taint2 propagate labels through pointers as well.
+
+	stop_on_first_violation:
 	  True  — end the replay as soon as one OOB write is confirmed tainted.  The
 	          run exits cleanly, because it stops before this recording's desync
 	          point (see the module docstring).
@@ -1580,7 +1586,9 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 				  extra_args=conf["extra_qemu_machine_args"],
 				  os_version="linux-64-linux:1.0")
 
-	panda.load_plugin("taint2", args={"opt": True, "no_tp": True})
+	print(f'[analysis1] taint2: tainted-pointer propagation '
+		  f'{"ENABLED" if taint_pointers else "disabled"}')
+	panda.load_plugin("taint2", args={"opt": True, "no_tp": not taint_pointers})
 	panda.load_plugin("osi", args={"disable-autoload": True})
 	panda.load_plugin("osi_linux", args={
 		"kconf_file": kernel.info_path, "kconf_group": "linux:1.0:64"
@@ -3549,8 +3557,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 
 
 def replay(rootfs, kernel, enable_logging=True, record='record',
-		   stop_on_first_violation=True):
-	"""stop_on_first_violation:
+		   stop_on_first_violation=True, taint_pointers=False):
+	"""taint_pointers:
+	  False (default) — taint2 is loaded with no_tp: labels are not propagated
+	                    through tainted pointers.
+	  True            — taint2 propagates labels through tainted pointers too.
+
+	stop_on_first_violation:
 	  True  (default) — return as soon as one OOB write is confirmed tainted.
 	                    Exits cleanly.
 	  False           — run to the end of the analysis, collecting every
@@ -3560,4 +3573,5 @@ def replay(rootfs, kernel, enable_logging=True, record='record',
 	                    to that point (it is rewritten after each one)."""
 	print("starting")
 	rrr.replay(rootfs, kernel, record, __replay,
-			   additional_args=[enable_logging, stop_on_first_violation])
+			   additional_args=[enable_logging, stop_on_first_violation,
+								taint_pointers])
