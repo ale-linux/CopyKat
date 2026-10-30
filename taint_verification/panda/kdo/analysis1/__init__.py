@@ -935,6 +935,110 @@ BUG_CATALOGUE = (
 		'confirm':     'hook',
 	},
 	{
+		# CONFIG_KASAN_INLINE, the same "THE THIRD SHAPE" as fuse_dev_do_write and
+		# ntfs_set_ea, and the THIRD target on __asan_report_store4_noabort.  The
+		# report:
+		#
+		#     BUG: KASAN: slab-out-of-bounds in stack_map_get_build_id_offset+0x690/0x780
+		#     Write of size 4 at addr ffff88801126eb30 by task repro/3542
+		#     kasan_report+0xbb/0x190
+		#     stack_map_get_build_id_offset+0x690/0x780
+		#     __bpf_get_stackid+0x8a9/0x9a0
+		#     bpf_get_stackid_pe+0x24b/0x350
+		#     bpf_overflow_handler+0x296/0x6b0
+		#
+		# The disassembly around the thunk call (gdb prints its <sym+N> labels in
+		# DECIMAL; the offsets below are the hex ones the report uses):
+		#
+		#   ...+0x67c: mov    (%rsp),%eax
+		#   ...+0x67f: jmp    ...+0xf1            ; in-bounds path rejoins
+		#   ...+0x684: mov    %r12,%rdi           ; the OOB address
+		#   ...+0x687: mov    %rax,(%rsp)         ; spill across the call
+		#   ...+0x68b: call   __asan_report_store4_noabort
+		#   ...+0x690: mov    (%rsp),%rax         <- +0x690 (ret addr)
+		#   ...+0x694: jmp    ...+0xd2            ; back to the hot path
+		#
+		# 0x68b + 5 (call rel32) = 0x690, so the offset the report prints is the RETURN
+		# ADDRESS of that call, which is what callstack_instr gives as callers[0] at
+		# thunk entry — hence ('frame', 0, ..., 0x690).
+		#
+		# The thunk's own disassembly is worth recording here, because it is the first
+		# time this catalogue has had it in full and it CONFIRMS what the other
+		# confirm='hook' entries infer:
+		#
+		#   __asan_report_store4_noabort+0:  mov    (%rsp),%rcx   ; _RET_IP_
+		#   __asan_report_store4_noabort+4:  mov    $0x1,%edx     ; is_write = true
+		#   __asan_report_store4_noabort+9:  mov    $0x4,%esi     ; size = 4
+		#   __asan_report_store4_noabort+14: jmp    kasan_report  ; NOT a call
+		#
+		# Four things fall out of those four instructions.  rdi is untouched, so the
+		# address the thunk forwards is exactly the one its caller put there, which is
+		# what args='ptr' reads.  The width really is a constant from the symbol's name
+		# ($0x4,%esi), which is what access_size supplies.  is_write is hardcoded true,
+		# matching the is_write=True that _on_hook_call synthesises.  And `mov
+		# (%rsp),%rcx` takes _RET_IP_ off the stack at thunk entry, i.e. the thunk's own
+		# return address — exactly the callers[0] that _hook_report_ip falls back to for
+		# a non-'ptr_size_write' hook.  So all four fields of the synthesised report
+		# record are the same values a real kasan_report would have received.
+		#
+		# The terminal `jmp kasan_report` is the tail call that makes
+		# confirm='kasan_report' unusable and confirm='hook' necessary: callstack_instr
+		# only pushes a frame for a CALL, so on_call(kasan_report) never fires.  The
+		# report's own backtrace shows it from the other side — kasan_report+0xbb sits
+		# above stack_map_get_build_id_offset+0x690 with no thunk frame between them.
+		# Being on the failure path only, reaching the thunk IS the report, so the
+		# window is confirmed at entry and no kasan_multi_shot is needed.
+		#
+		# dest-only: there is no source buffer to read.  The thunk is handed only an
+		# address, and the store itself writes a computed 4-byte value (the build-id
+		# offset the function calculates), not bytes copied from anywhere — so taint
+		# reaches it through taint_mix rather than a byte-for-byte taint_copy, and only
+		# the destination probe gives the right answer.  Same reasoning as
+		# fuse_dev_do_write and bpf_get_stackid.  The store executes on a stock kernel
+		# because the thunk returns void and the instrumented code acts on nothing it
+		# returns (see "GETTING THE STORE TO EXECUTE").
+		#
+		# Third target on this thunk, after fuse_dev_do_write and ntfs_set_ea; the
+		# ntfs_set_ea entry below explains why that widens hook_prefilter rather than
+		# breaking it, and the same reasoning applies unchanged to a third frame-0
+		# pedigree.
+		#
+		# What is new is the one pair in this catalogue whose call stacks genuinely
+		# overlap: this report's stack runs through __bpf_get_stackid+0x8a9, and the
+		# bpf_get_stackid entry above is anchored at __bpf_get_stackid+0x93a on the
+		# store8 thunk.  Different thunks and different offsets, so they describe
+		# different accesses and cannot confirm each other — but both are destination
+		# targets on the single watcher/probe pair, so if both hit in one replay the
+		# later hit closes the earlier window as 'superseded by another target's
+		# destination probe'.  That is _on_hook_call's existing arbitration doing what
+		# it is for, not a new hazard; worth knowing only because here it could
+		# plausibly fire, where for the other shared-hook pairs one kernel has one of
+		# the two bugs and not both.
+		#
+		# ctx='repro': "by task repro/3542".  The stack reaches here from a page fault
+		# in the reproducer (asm_exc_page_fault -> ___perf_sw_event -> a perf overflow
+		# handler running a BPF program), which is still the reproducer's own task, not
+		# a kworker or a hard-IRQ context.
+		'id':          'stack_map_get_build_id_offset',
+		'hook':        '__asan_report_store4_noabort',
+		'args':        'ptr',
+		'access_size': 4,          # the '4' in the hook's name; "Write of size 4"
+		# One instruction in a cold report block is already unique, and the thunk is
+		# ice cold — only ever reached on a failed check — so frame 0 alone is enough.
+		# __bpf_get_stackid+0x8a9 and bpf_get_stackid_pe+0x24b are on the stack (the
+		# report prints both without a '?', so ORC resolved them from real frames) and
+		# either can be added as an 'anywhere' if this ever needs more pruning.
+		'pedigree':    (('frame', 0, ('stack_map_get_build_id_offset',), 0x690),),
+		# The cold block jumps back to +0xd2, so the store lands on the hot path inside
+		# stack_map_get_build_id_offset itself, well before it returns to
+		# __bpf_get_stackid.
+		'store_fn':    'stack_map_get_build_id_offset',
+		'ctx':         'repro',
+		'source':      False,
+		'dest':        True,
+		'confirm':     'hook',
+	},
+	{
 		# CONFIG_KASAN_INLINE again — the third instance of "THE THIRD SHAPE",
 		# this time a ONE-BYTE store.  The report:
 		#
