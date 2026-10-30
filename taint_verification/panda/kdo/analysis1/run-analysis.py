@@ -57,6 +57,24 @@ multi_shot = False
 taint_pointers = False
 
 
+def _analysis_complete(repro_out):
+    """True if analysis1.json says __replay reached the end of its finally block.
+
+    This is what separates the two kinds of "Replay failed -6".  A SIGABRT
+    raised while the replay is still running means the results are partial and
+    must stay a hard error.  A SIGABRT raised after __replay has finished —
+    which is what QEMU/LLVM teardown in the forked child does — leaves a
+    complete analysis1.json behind, and failing the batch over it just hides
+    good results.  _write_analysis() sets 'analysis_complete' as the very last
+    thing it writes, so its presence is the dividing line."""
+    path = os.path.join(repro_out, 'analysis1.json')
+    try:
+        with open(path) as f:
+            return json.load(f).get('analysis_complete') is True
+    except (OSError, ValueError):
+        return False
+
+
 def doit(repro):
     repro_id    = repro['id']
     kernel_name = repro['kernel']
@@ -93,22 +111,43 @@ def doit(repro):
     # Recording files live in the repro output dir; replay must run from there.
     os.chdir(repro_out)
 
-    if multi_shot:
-        # A multi-shot run deliberately keeps going past the first confirmed
-        # violation, which means it runs into this recording's desync point and
-        # is killed by SIGABRT — rrr surfaces that as "Replay failed -6".
-        # Every hit has already been flushed to analysis1.json by then, so
-        # report it and carry on rather than letting one expected abort take
-        # down the whole pool.map batch.
-        try:
+    # A replay can die of SIGABRT in two quite different situations, and only
+    # one of them is a real failure:
+    #
+    #   * DURING the analysis — a --multi-shot run reaching this recording's
+    #     desync point, or anything that aborts libpanda mid-replay.  Results
+    #     are partial.
+    #   * AFTER it — the forked child abort()s in QEMU/LLVM teardown once
+    #     __replay has already returned.  analysis1.json is complete.
+    #
+    # rrr reports both identically as "Replay failed -6", so the exception says
+    # nothing on its own; analysis1.json's 'analysis_complete' marker is what
+    # tells them apart.  --multi-shot is the one case where an abort is EXPECTED
+    # mid-analysis, so it keeps accepting a partial result as before.
+    try:
+        if multi_shot:
             analysis1.replay(rootfs, kernel, stop_on_first_violation=False,
                              taint_pointers=taint_pointers)
-        except Exception as e:
+        else:
+            analysis1.replay(rootfs, kernel, taint_pointers=taint_pointers)
+    except Exception as e:
+        if multi_shot:
             print(f"[run-analysis] {repro_id}: replay ended with {e!r} — expected "
                   f"in --multi-shot; results already written to analysis1.json")
             return 'aborted-after-collection'
-    else:
-        analysis1.replay(rootfs, kernel, taint_pointers=taint_pointers)
+        if _analysis_complete(repro_out):
+            # The analysis finished and then the child died on its way out.
+            # Warn, keep the result.
+            print(f"[run-analysis] WARNING: {repro_id}: {e!r} AFTER the analysis "
+                  f"completed — analysis1.json is complete, treating as success. "
+                  f"This is teardown in the replay child, not a bad analysis.",
+                  file=sys.stderr)
+            return 'completed-then-aborted'
+        # Partial results: stays loud, exactly as before.  Name the repro while
+        # re-raising, though: pool.map surfaces whichever worker failed FIRST
+        # and discards the rest, so a bare "Replay failed N" in a 40-way batch
+        # does not say which of the 40 it came from.
+        raise Exception(f"{repro_id} (kernel={kernel_name}) failed: {e}") from e
 
     return True
 

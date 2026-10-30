@@ -194,6 +194,106 @@ class Stimulus:
 
         self.built_path = build_path
 
+class KernelinfoGenerationError(Exception):
+    """gdb could not supply the offsets osi_linux needs."""
+
+
+# Keys read with the non-OPTIONAL macro by osi_linux's read_kernelinfo() for any
+# kernel newer than 2.4.254.  Mirrors analysis1's list of the same name; both
+# derive from kernelinfo_read.c, and they are kept separate because rrr must not
+# import kdo.
+_KI_REQUIRED_KEYS = (
+    'version.a', 'version.b', 'version.c',
+    'task.init_addr', 'task.size', 'task.tasks_offset',
+    'task.per_cpu_offsets_addr', 'task.per_cpu_offset_0_addr',
+    'task.current_task_addr', 'task.group_leader_offset', 'task.stack_offset',
+    'task.real_cred_offset', 'task.cred_offset', 'task.real_parent_offset',
+    'task.parent_offset', 'task.pid_offset', 'task.tgid_offset',
+    'task.mm_offset', 'task.comm_offset', 'task.comm_size', 'task.files_offset',
+    'cred.uid_offset', 'cred.gid_offset', 'cred.euid_offset', 'cred.egid_offset',
+    'mm.size', 'mm.pgd_offset', 'mm.arg_start_offset', 'mm.start_brk_offset',
+    'mm.brk_offset', 'mm.start_stack_offset',
+    'vma.size', 'vma.vm_mm_offset', 'vma.vm_start_offset', 'vma.vm_end_offset',
+    'vma.vm_file_offset', 'vma.vm_flags_offset',
+    'fs.f_path_dentry_offset', 'fs.f_path_mnt_offset', 'fs.fdt_offset',
+    'fs.fdtab_offset', 'fs.f_pos_offset', 'fs.fd_offset',
+    'qstr.size', 'qstr.name_offset',
+    'path.d_dname_offset', 'path.d_name_offset', 'path.d_iname_offset',
+    'path.d_parent_offset', 'path.d_op_offset', 'path.mnt_root_offset',
+    'path.mnt_parent_offset', 'path.mnt_mountpoint_offset',
+)
+
+
+def _ki_check(path, debug_path):
+    """Reject a kernelinfo.conf osi_linux would not accept.
+
+    Two distinct failures produce a file that looks plausible:
+
+      * EMPTY VALUES.  gdb_printf() returns '' when gdb cannot evaluate an
+        expression, and that goes straight out as `key = `.  glib's
+        g_key_file_get_integer() errors on that exactly as it does on a missing
+        key, so one such line is enough for read_kernelinfo() to refuse the
+        file.
+      * TRUNCATION.  Generation dies partway -- the gdb session times out, the
+        process is killed, anything -- and leaves a file holding only the keys
+        written up to that point.  Nothing in it is malformed; it is just
+        short.  A 5-line stub carrying `name` and version.a/b/c is the
+        canonical shape, those being everything written before gdb is first
+        consulted.
+
+    Checking only for empty values catches the first and misses the second, so
+    check both: every required key must be PRESENT and non-empty.  Which one
+    happened is worth distinguishing in the message, because they point at
+    different causes.
+
+    Either way osi_linux rejects the file and panda's plugin loader calls
+    abort() -- a SIGABRT with no Python traceback, hundreds of seconds into a
+    replay.  Catching it here, before the file is published, is much cheaper."""
+    present = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('[') or line.startswith('#'):
+                continue
+            key, sep, val = line.partition('=')
+            if sep:
+                present[key.strip()] = val.strip()
+
+    empty   = [k for k in _KI_REQUIRED_KEYS if present.get(k) == '']
+    absent  = [k for k in _KI_REQUIRED_KEYS if k not in present]
+
+    if not empty and not absent:
+        return
+
+    # Causes seen or plausible, roughly in order of likelihood.  A transient
+    # one matters as much as a permanent one here: before this check existed, a
+    # single bad generation left a file that `if not os.path.exists` then made
+    # permanent, so a 10-second timeout one afternoon could cost every later
+    # run.  That is why this raises instead of warning.
+    hint = (f'If keys are ABSENT, generation died partway: a pygdbmi timeout '
+            f'(gdb_printf allows 10s per query, 30s for the first, and loading '
+            f'symbols from a large vmlinux can exceed that), the process being '
+            f'killed, or gdb not being installed at all — retry first, since '
+            f'these are usually transient.  If keys are EMPTY, gdb ran but '
+            f'could not evaluate the expressions; check with `gdb -batch -nx '
+            f'{debug_path} -ex "ptype struct task_struct"`, noting that BTF is '
+            f'not enough (gdb needs DWARF, so a kernel built without '
+            f'CONFIG_DEBUG_INFO still yields working BTF here).')
+    # Say which of the two shapes this is: absent keys mean generation stopped
+    # early, empty ones mean it ran and gdb had no answer.  Conflating them is
+    # how a truncated file gets misread as a gdb problem.
+    what = []
+    if absent:
+        what.append(f'{len(absent)} required key(s) never written, i.e. '
+                    f'generation stopped before reaching them: {absent}')
+    if empty:
+        what.append(f'{len(empty)} required key(s) written with no value, i.e. '
+                    f'gdb had no answer for them: {empty}')
+    raise KernelinfoGenerationError(
+        'this kernelinfo.conf would be rejected by osi_linux — '
+        + '; '.join(what) + f'.  {hint}')
+
+
 # Origin of a kernel source code, either from a git URL or on-disk directory
 class Kernel:
     @classmethod
@@ -286,7 +386,34 @@ class Kernel:
         self.info_path = os.path.join(os.getcwd(), "kernelinfo.conf")
         if not os.path.exists(self.info_path):
             log(f"Generating {self.info_path} for PANDA ...")
-            info_file = open(self.info_path, "w+")
+            # Write to a temp file in the same directory and rename only once
+            # generation has fully succeeded.  Writing info_path directly is
+            # how a BROKEN kernelinfo.conf becomes permanent: the `if not
+            # os.path.exists` above means any file here is re-used forever, so
+            # a gdb session that answered nothing (no DWARF in vmlinux, gdb
+            # missing, a crash partway through) leaves behind a file holding
+            # only the handful of keys written before gdb was consulted.  Every
+            # later run then skips generation and hands that file to osi_linux,
+            # which rejects it and abort()s the process.
+            info_fd, info_tmp = tempfile.mkstemp(
+                dir=os.path.dirname(self.info_path) or '.',
+                prefix='.kernelinfo.conf.', suffix='.tmp')
+            info_file = os.fdopen(info_fd, "w+")
+            try:
+                self._write_kernelinfo(info_file, info_tmp)
+            except BaseException:
+                info_file.close()
+                try:
+                    os.unlink(info_tmp)
+                except OSError:
+                    pass
+                raise
+
+    def _write_kernelinfo(self, info_file, info_tmp):
+            """Fill a kernelinfo.conf for osi_linux, then publish it.
+
+            Split out of __init__ purely so the caller can delete the temp file
+            on failure; the body is unchanged."""
 
             file_bzImage = subprocess.run(["file", self.built_path],
                                           capture_output=True, text=True)
@@ -466,6 +593,17 @@ class Kernel:
 
             gdbmi.exit()
             info_file.close()
+
+            # gdb answering NOTHING is the failure mode worth catching here:
+            # every offset below comes from gdb_printf(), which returns '' when
+            # gdb cannot evaluate the expression, and an empty value is written
+            # out as a bare `key = `.  osi_linux's read_kernelinfo() treats that
+            # exactly like a missing key and refuses the whole file, so a file
+            # full of them is useless — better to say so now, naming the likely
+            # cause, than to publish it and have the replay abort() much later.
+            _ki_check(info_tmp, self.debug_path)
+            os.replace(info_tmp, self.info_path)
+            log(f"Wrote {self.info_path}")
 
 # Origin of a rootfs (busybox + stimulus)
 class Rootfs:

@@ -1113,7 +1113,7 @@ BUG_CATALOGUE = (
 		# wrong one.  A missing symbol instead fails loudly ('pedigree symbol
 		# ntfs_set_ea not found', target disabled with a reason in analysis1.json),
 		# which is the better failure for an offset that is only valid for one build.
-		'pedigree':    (('frame', 0, ('ntfs_set_ea',), 0x126d),),
+		'pedigree':    (('frame', 0, ('ntfs_set_ea',), 0x1271),),
 		# The store lands back on the hot path inside ntfs_set_ea itself (the cold
 		# block jumps to +0x79c), well before it returns to ntfs_setxattr.
 		'store_fn':    'ntfs_set_ea',
@@ -1517,6 +1517,136 @@ def _hexdump(data, tainted=frozenset(), missing=frozenset(), width=16):
 	return out
 
 
+# Keys osi_linux's read_kernelinfo() reads with the NON-optional macro for a
+# kernel newer than 2.4.254, i.e. every kernel we replay.  Derived from
+# panda/plugins/osi_linux/utils/kernelinfo/kernelinfo_read.c; the 2.4-only
+# else-branch is excluded, as are the five OPTIONAL_READ_INFO_* keys
+# (task.thread_group_offset, task.start_time_offset, task.switch_task_hook_addr,
+# mm.mmap_offset, vma.vm_next_offset) which may legitimately be absent or -1.
+#
+# Why this list has to exist here: read_kernelinfo() counts a failure for every
+# one of these it cannot parse, returns -1, and osi_linux's init_plugin then
+# returns false — at which point panda's _panda_require() calls abort()
+# (callbacks.c:408).  That is a SIGABRT from C during load_plugin(), so there is
+# no exception to catch and nothing to report: the child just dies with -6 and
+# the only clue is "FAILED to load required plugin osi_linux" on stderr.
+# Checking the file ourselves first turns that into a normal Python error.
+_OSI_LINUX_REQUIRED_KEYS = (
+	# version gate — read before the branch, so always required
+	'version.a', 'version.b', 'version.c',
+	# task_struct
+	'task.init_addr', 'task.size', 'task.tasks_offset',
+	'task.per_cpu_offsets_addr', 'task.per_cpu_offset_0_addr',
+	'task.current_task_addr', 'task.group_leader_offset', 'task.stack_offset',
+	'task.real_cred_offset', 'task.cred_offset', 'task.real_parent_offset',
+	'task.parent_offset', 'task.pid_offset', 'task.tgid_offset',
+	'task.mm_offset', 'task.comm_offset', 'task.comm_size', 'task.files_offset',
+	# cred
+	'cred.uid_offset', 'cred.gid_offset', 'cred.euid_offset', 'cred.egid_offset',
+	# mm_struct
+	'mm.size', 'mm.pgd_offset', 'mm.arg_start_offset', 'mm.start_brk_offset',
+	'mm.brk_offset', 'mm.start_stack_offset',
+	# vm_area_struct
+	'vma.size', 'vma.vm_mm_offset', 'vma.vm_start_offset', 'vma.vm_end_offset',
+	'vma.vm_file_offset', 'vma.vm_flags_offset',
+	# file / files_struct / fdtable
+	'fs.f_path_dentry_offset', 'fs.f_path_mnt_offset', 'fs.fdt_offset',
+	'fs.fdtab_offset', 'fs.f_pos_offset', 'fs.fd_offset',
+	# qstr
+	'qstr.size', 'qstr.name_offset',
+	# dentry / dentry_operations / vfsmount
+	'path.d_dname_offset', 'path.d_name_offset', 'path.d_iname_offset',
+	'path.d_parent_offset', 'path.d_op_offset', 'path.mnt_root_offset',
+	'path.mnt_parent_offset', 'path.mnt_mountpoint_offset',
+)
+
+
+class KernelinfoError(Exception):
+	"""A kernelinfo.conf osi_linux would reject (and abort() over)."""
+
+
+def _check_kernelinfo(path, group='linux:1.0:64'):
+	"""Fail loudly if osi_linux would reject this kernelinfo.conf.
+
+	Mirrors read_kernelinfo()'s own acceptance test: the group must exist and
+	every key in _OSI_LINUX_REQUIRED_KEYS must be present with a value glib can
+	parse as a number.  An EMPTY value fails exactly like a missing one — glib's
+	g_key_file_get_integer() sets its GError for `key =` just as it does for a
+	key that was never written (verified against libglib directly), and rrr
+	writes `key = ` whenever gdb had no answer for the field, so empty is the
+	shape this actually takes in practice.
+
+	Raising here rather than letting load_plugin() run costs one file parse and
+	buys an error that names the offending keys."""
+	try:
+		with open(path) as f:
+			lines = f.read().splitlines()
+	except OSError as e:
+		raise KernelinfoError(f'cannot read kernelinfo {path}: {e}') from e
+
+	# Flat parse per group: osi_linux reads one group, and a key is only usable
+	# if it sits under the group we ask for.
+	groups, cur = {}, None
+	for line in lines:
+		line = line.strip()
+		if not line or line.startswith('#'):
+			continue
+		if line.startswith('[') and line.endswith(']'):
+			cur = line[1:-1]
+			groups.setdefault(cur, {})
+			continue
+		if cur is None or '=' not in line:
+			continue
+		key, _, val = line.partition('=')
+		groups[cur][key.strip()] = val.strip()
+
+	if group not in groups:
+		raise KernelinfoError(
+			f'kernelinfo {path} has no group [{group}] — osi_linux would '
+			f'abort() on load.  Groups present: {sorted(groups)}')
+
+	kv = groups[group]
+	# ABSENT and EMPTY are reported separately, because they mean different
+	# things and conflating them sends you after the wrong cause.  A key that
+	# was never written means generation stopped before reaching it — the file
+	# is truncated.  A key written as `key = ` means generation ran and gdb had
+	# no answer for that field.  rrr leaves a truncated file behind whenever
+	# generation dies partway, and because Kernel() skips generation when the
+	# file exists, that stub is then reused forever.
+	absent, empty, unparsable = [], [], []
+	for key in _OSI_LINUX_REQUIRED_KEYS:
+		if key not in kv:
+			absent.append(key)
+			continue
+		if kv[key] == '':
+			empty.append(key)
+			continue
+		try:
+			int(kv[key], 0)
+		except ValueError:
+			unparsable.append(f'{key}={kv[key]!r}')
+
+	if absent or empty or unparsable:
+		parts = []
+		if absent:
+			parts.append(f'{len(absent)} key(s) never written (file is '
+						 f'truncated — generation stopped early): {absent}')
+		if empty:
+			parts.append(f'{len(empty)} key(s) written with no value (gdb had '
+						 f'no answer for them): {empty}')
+		if unparsable:
+			parts.append(f'{len(unparsable)} key(s) not numeric: {unparsable}')
+		raise KernelinfoError(
+			f'kernelinfo {path} group [{group}] is not loadable by osi_linux. '
+			f'{"; ".join(parts)}.  Regenerate it with '
+			f'`gen-kernelinfo.py <kernel> --force` — note that --force is '
+			f'required, since Kernel() leaves an existing file alone no matter '
+			f'how broken it is.')
+
+	print(f'[analysis1] kernelinfo {path}: all '
+		  f'{len(_OSI_LINUX_REQUIRED_KEYS)} osi_linux-required keys present')
+
+
 def _load_kernelinfo(path):
 	"""Parse a kernelinfo.conf and return a flat dict of key -> int.
 
@@ -1576,6 +1706,12 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		).name, "w"
 	)
 	faulthandler.enable(file=crashlogf)
+
+	# Belt and braces: replay() already checked this in the parent, where the
+	# message can propagate.  Repeating it here covers a caller that invokes
+	# __replay directly, and costs one file parse.  osi_linux abort()s the whole
+	# process on a bad kernelinfo, and an abort() cannot be caught.
+	_check_kernelinfo(kernel.info_path)
 
 	ki = _load_kernelinfo(kernel.info_path)
 	print(f'[analysis1] kernelinfo loaded from {kernel.info_path}: {len(ki)} keys')
@@ -3553,6 +3689,13 @@ def __replay(rootfs, kernel, record, _ignored_addresses, func_map, symbol_map,
 		print(f'[analysis1] total taint labels created: {ctr["labels"] - 1}')
 
 		analysis['replay_time'] = end - start
+		# Explicit marker that the analysis ran to the end of __replay.  The
+		# caller needs to tell "the child died of SIGABRT with the analysis
+		# already complete" from "it died partway through": the first is a
+		# teardown nuisance, the second has to stay a hard failure.  replay_time
+		# alone is not that signal — it is also written on the exception path
+		# above — so say it directly.  See run-analysis.py's _analysis_complete.
+		analysis['analysis_complete'] = True
 		_write_analysis()
 
 
@@ -3571,6 +3714,15 @@ def replay(rootfs, kernel, enable_logging=True, record='record',
 	                    desync point, so rrr will raise "Replay failed -6" even
 	                    though analysis1.json holds every observation collected up
 	                    to that point (it is rewritten after each one)."""
+	# Check kernelinfo HERE, in the parent, not just inside __replay.
+	# rrr.replay() runs __replay in a forked child and reports only its exit
+	# code ("Replay failed 1"), so an exception raised in the child has its
+	# message printed to that child's stderr and then thrown away — which in a
+	# 40-way pool.map is interleaved with thousands of lines of replay output
+	# and effectively invisible.  Raising before the fork puts the reason in the
+	# exception the caller actually sees.
+	_check_kernelinfo(kernel.info_path)
+
 	print("starting")
 	rrr.replay(rootfs, kernel, record, __replay,
 			   additional_args=[enable_logging, stop_on_first_violation,
